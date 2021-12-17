@@ -1,233 +1,361 @@
+use crate::backend::{
+    DiscoveryEvent, DiscoveryService, Endpoint, EndpointRef, Service, Services,
+};
 use anyhow::{anyhow, Context, Result};
 use futures::TryStreamExt;
+use http::Uri;
 use k8s_openapi::api::core::v1::Pod;
-use kube::{api::ListParams, runtime, runtime::watcher::Event, Api, Client, Config};
-use std::{collections::BTreeMap, net::IpAddr};
-use tokio::pin;
+use kube::{
+    api::ListParams, runtime, runtime::watcher::Event, Api, Client, Config,
+};
+use std::{
+    collections::{BTreeMap, HashSet},
+    mem,
+    net::IpAddr,
+    sync::Arc,
+};
+use tokio::{pin, sync::mpsc::Sender};
 use tracing::{error, info, warn};
 use tuple_transpose::TupleTranspose;
 
+static NAME: &str = "kubernetes";
 static API_VERSION_LABEL: &str = "state-proxy.io/use";
 static API_VERSION: &str = "v0";
 static SERVICES_ANNOTATION: &str = "state-proxy.io/services";
 
-pub enum K8sConfig {
+pub enum KubernetesConfig {
     Infer,
-    Explicit(Config),
+    Explicit { url: Uri },
 }
 
-impl ProxiedPodMap {
-    fn new() -> Self {
-        Self::default()
+struct KubernetesDiscoveryService {
+    name: Arc<String>,
+
+    config: KubernetesConfig,
+    namespace: String,
+}
+
+impl KubernetesDiscoveryService {
+    fn new(config: KubernetesConfig, namespace: Option<String>) -> Self {
+        let namespace = namespace.unwrap_or_else(|| "default".to_owned());
+        let name = match &config {
+            KubernetesConfig::Infer => format!("kubernetes/{}", namespace),
+            KubernetesConfig::Explicit { url } => {
+                format!("kubernetes/{}/{}", url, namespace)
+            }
+        };
+
+        Self {
+            name: Arc::new(name),
+
+            config,
+            namespace,
+        }
     }
 
-    fn clear(&mut self) {
-        self.map.clear();
-    }
+    async fn run(self, send: Sender<DiscoveryEvent>) -> Result<()> {
+        let client = if let KubernetesConfig::Explicit { url } = self.config {
+            // URI must have a scheme otherwise the client initialization will panic instead of
+            // erroring out. Check that here to avoid user-unfriendly errors
+            if url.scheme().is_none() {
+                return Err(anyhow!(
+                    "Kubernetes cluster URL must have a scheme component"
+                ));
+            }
 
-    fn register(&mut self, id: ProxiedPodId, proxied: ProxiedPod) {
-        if self.map.insert(id.clone(), proxied).is_some() {
-            info!("Updated pod {} in the list of proxied pods", id);
+            info!(
+                "Connecting to the Kubernetes cluster at {}",
+                url
+            );
+
+            Client::try_from(Config::new(url))
         } else {
-            info!("Added pod {} to the list of proxied pods", id);
+            info!("Connecting to the Kubernetes cluster specified by the environment");
+
+            Client::try_default().await
         }
-    }
+        .with_context(|| {
+            format!("while trying to connect to the Kubernetes cluster: {}", self.name)
+        })?;
 
-    fn delete(&mut self, id: ProxiedPodId) {
-        if self.map.remove(&id).is_some() {
-            info!("Removed pod {} from the list of proxied pods", id);
-        }
-    }
-}
-
-enum ProxiedPodMapAction {
-    Register {
-        id: ProxiedPodId,
-        proxied: ProxiedPod,
-    },
-    Delete {
-        id: ProxiedPodId,
-    },
-}
-
-impl ProxiedPodMapAction {
-    fn register(id: ProxiedPodId, proxied: ProxiedPod) -> Self {
-        Self::Register { id, proxied }
-    }
-
-    fn delete(id: ProxiedPodId) -> Self {
-        Self::Delete { id }
-    }
-
-    fn execute(self, proxied_map: &mut ProxiedPodMap) {
-        match self {
-            Self::Register { id, proxied } => proxied_map.register(id, proxied),
-            Self::Delete { id } => proxied_map.delete(id),
-        }
-    }
-}
-
-struct ProxiedPod {
-    name: String,
-    addr: IpAddr,
-}
-
-impl ProxiedPod {
-    fn new(name: String, addr: IpAddr, services: Vec<ProxiedService>) -> Self {
-        unimplemented!()
-    }
-}
-
-struct ProxiedService {}
-
-pub async fn run_communication(config: K8sConfig) {
-    if let Err(err) = do_run(config).await {
-        error!("{:?}", err);
-    }
-}
-
-async fn do_run(config: K8sConfig) -> Result<()> {
-    // URI must have a scheme otherwise client initialization will panic instead of erroring out.
-    // Check that here to avoid user-unfriendly errors
-    if let K8sConfig::Explicit(Config { cluster_url, .. }) = &config {
-        if cluster_url.scheme().is_none() {
-            return Err(anyhow!(
-                "Kubernetes cluster URL must have a scheme component"
-            ));
-        }
-    }
-
-    let client = if let K8sConfig::Explicit(config) = config {
-        info!(
-            "Connecting to the Kubernetes cluster at {}",
-            config.cluster_url
+        info!("{}: Watching pods", self.name);
+        // TODO: retry on error
+        let pods = runtime::watcher(
+            Api::<Pod>::namespaced(client, &self.namespace),
+            ListParams {
+                // We are only interested in pods that have explicitly asked to be proxied with us
+                label_selector: Some(format!(
+                    "{}={}",
+                    API_VERSION_LABEL, API_VERSION
+                )),
+                ..ListParams::default()
+            },
         );
+        pin!(pods);
+        let mut runtime = KubernetesDiscoveryRuntime::new(&self.name, send);
+        while let Some(event) = pods.try_next().await.with_context(|| {
+            format!(
+                "while watching pods for the Kubernetes cluster: {}",
+                self.name
+            )
+        })? {
+            runtime.handle_pod_event(event).await;
+        }
 
-        Client::try_from(config)
-    } else {
-        info!("Connecting to the Kubernetes cluster specified by the environment");
-
-        Client::try_default().await
+        Err(anyhow!(
+            "pod watch stream closed unexpectedly for Kubernetes cluster: {}",
+            self.name
+        ))
     }
-    .context("while trying to connect to the Kubernetes cluster")?;
-
-    info!("Watching pods from the Kubernetes cluster");
-    // TODO: implement retry on error
-    let pods = runtime::watcher(
-        Api::<Pod>::default_namespaced(client),
-        ListParams {
-            // We are only interested in pods that have explicitly asked to be proxied with us
-            label_selector: Some(format!("{}={}", API_VERSION_LABEL, API_VERSION)),
-            ..ListParams::default()
-        },
-    );
-    pin!(pods);
-    while let Some(event) = pods.try_next().await.context("while watching pods")? {
-        handle_pod_event(event).await?;
-    }
-
-    Err(anyhow!("pod watch stream closed unexpectedly"))
 }
 
-async fn handle_pod_event(event: Event<Pod>) -> Result<()> {
-    match event {
-        Event::Applied(pod) => {
-            if let Some(action) = parse_useful_pod(pod)? {
-                action.execute(&mut *G_PROXIED_PODS.lock().await);
+impl DiscoveryService for KubernetesDiscoveryService {
+    fn name(&self) -> Arc<String> {
+        self.name.clone()
+    }
+
+    fn run_with_sender(self, send: Sender<DiscoveryEvent>) {
+        tokio::spawn(async move {
+            if let Err(err) = self.run(send).await {
+                error!("{:?}", err);
             }
+        });
+    }
+}
+
+struct KubernetesDiscoveryRuntime<'a> {
+    name: &'a Arc<String>,
+
+    send: Sender<DiscoveryEvent>,
+    known_pod_uids: HashSet<String>,
+}
+
+impl<'a> KubernetesDiscoveryRuntime<'a> {
+    fn new(name: &'a Arc<String>, send: Sender<DiscoveryEvent>) -> Self {
+        Self {
+            name,
+
+            send,
+            known_pod_uids: HashSet::new(),
         }
-        Event::Deleted(pod) => {
-            if let Some(uid) = pod.metadata.uid {
-                G_PROXIED_PODS.lock().await.delete(uid);
-            } else {
-                warn!("Received a pod deletion event without the pod UID");
+    }
+
+    async fn handle_pod_event(&mut self, event: Event<Pod>) -> Result<()> {
+        match event {
+            Event::Applied(pod) => {
+                if let Some(uid) = &pod.metadata.uid {
+                    let is_new = self.known_pod_uids.insert(uid.to_owned());
+                    self.apply_pod(pod, is_new).await?;
+                }
             }
-        }
-        Event::Restarted(all_pods) => {
-            let mut proxied_map = G_PROXIED_PODS.lock().await;
-            proxied_map.clear();
-            for pod in all_pods {
-                if let Some(action) = parse_useful_pod(pod)? {
-                    action.execute(&mut proxied_map);
+            Event::Deleted(pod) => {
+                if let Some(uid) = pod.metadata.uid {
+                    self.known_pod_uids.remove(&uid);
+                    self.send
+                        .send(DiscoveryEvent::remove(Arc::new(
+                            EndpointRef::new(self.name.clone(), uid),
+                        )))
+                        .await;
+                } else {
+                    warn!(
+                        "{}: Received a pod deletion event without the pod UID",
+                        self.name
+                    );
+                }
+            }
+            Event::Restarted(pods) => {
+                let mut current_pod_uids = HashSet::new();
+                for pod in pods {
+                    if let Some(uid) = &pod.metadata.uid {
+                        let is_new = self.known_pod_uids.contains(uid);
+                        current_pod_uids.insert(uid.to_owned());
+                        self.apply_pod(pod, is_new).await?;
+                    }
+                }
+
+                let old_pod_uids =
+                    mem::replace(&mut self.known_pod_uids, current_pod_uids);
+                for uid in old_pod_uids {
+                    if !self.known_pod_uids.contains(&uid) {
+                        self.send
+                            .send(DiscoveryEvent::remove(Arc::new(
+                                EndpointRef::new(self.name.clone(), uid),
+                            )))
+                            .await;
+                    }
                 }
             }
         }
+
+        Ok(())
     }
 
-    Ok(())
-}
+    async fn apply_pod(&self, pod: Pod, is_new: bool) -> Result<()> {
+        if let Some(status) = pod.status {
+            // Take everything we care about out of those endless `Option`s
+            let meta = pod.metadata;
+            if let Some((uid, name, annotations, address, phase)) = (
+                meta.uid,
+                meta.name,
+                meta.annotations,
+                status.pod_ip,
+                status.phase,
+            )
+                .transpose()
+            {
+                let address = address.parse().with_context(|| {
+                    format!(
+                        "while parsing the address {} of pod {} ({}) from the Kubernetes cluster: {}",
+                        address, name, uid, self.name
+                    )
+                })?;
+                let endpoint_ref =
+                    Arc::new(EndpointRef::new(self.name.clone(), uid));
 
-// A "useful" pod is one that is fully defined and is either in the `Succeeded` or `Failed`
-// phases. We don't care about the other pods
-fn parse_useful_pod(pod: Pod) -> Result<Option<ProxiedPodMapAction>> {
-    if let Some(status) = pod.status {
-        // Take everything we care about out of those endless `Option`s
-        let meta = pod.metadata;
-        if let Some((uid, name, annotations, addr, phase)) = (
-            meta.uid,
-            meta.name,
-            meta.annotations,
-            status.pod_ip,
-            status.phase,
-        )
-            .transpose()
-        {
-            let addr = addr.parse().with_context(|| {
-                format!(
-                    "while parsing the address {} of pod {} ({})",
-                    addr, name, uid
-                )
-            })?;
-            match phase.as_ref() {
-                "Running" => {
-                    return Ok(Some(ProxiedPodMapAction::register(
-                        uid.clone(),
-                        ProxiedPod::new(
-                            name.clone(),
-                            addr,
-                            services_from_annotations(annotations).with_context(|| {
-                                format!("while parsing services for pod {} ({})", name, uid)
-                            })?,
-                        ),
-                    )))
+                match phase.as_ref() {
+                    "Running" => {
+                        if is_new {
+                            let services = self.services_from_annotations(
+                                annotations,
+                                &endpoint_ref,
+                                &name,
+                                address,
+                            )?;
+                            if services.is_empty() {
+                                warn!(
+                                    "{}: pod {} ({}) did not define any services",
+                                    self.name, name, endpoint_ref.uid
+                                );
+                            } else {
+                                self.send
+                                    .send(DiscoveryEvent::add(
+                                        endpoint_ref,
+                                        services,
+                                    ))
+                                    .await;
+                            }
+                        } else {
+                            self.send
+                                .send(DiscoveryEvent::resume(endpoint_ref))
+                                .await;
+                        }
+                    }
+                    "Succeeded" => {
+                        self.send
+                            .send(DiscoveryEvent::remove(endpoint_ref))
+                            .await;
+                    }
+                    "Failed" => {
+                        self.send
+                            .send(DiscoveryEvent::suspend(endpoint_ref))
+                            .await;
+                    }
+                    "Unknown" => {
+                        warn!(
+                            "{}: pod {} ({}) is in an unknown state. Suspending pod until the situation resolves",
+                            self.name, name, endpoint_ref.uid
+                        );
+                        self.send
+                            .send(DiscoveryEvent::suspend(endpoint_ref))
+                            .await;
+                    }
+                    // If the pod is only pending, we don't care
+                    "Pending" => (),
+                    unknown => {
+                        warn!(
+                            "{}: received an unknown pod status from Kubernetes for pod {} ({}): {}. Suspending pod until the situation resolves",
+                            self.name, name, endpoint_ref.uid, unknown
+                        );
+                        self.send
+                            .send(DiscoveryEvent::suspend(endpoint_ref))
+                            .await;
+                    }
                 }
-                "Failed" => return Ok(Some(ProxiedPodMapAction::delete(uid))),
-                _ => (),
             }
         }
+
+        Ok(())
     }
 
-    Ok(None)
-}
-
-fn services_from_annotations(annotations: BTreeMap<String, String>) -> Result<Vec<ProxiedService>> {
-    let mut services = Vec::new();
-    if let Some(services_string) = annotations.get(SERVICES_ANNOTATION) {
-        for service_string in services_string.split(',') {
-            services.push(parse_service_string(service_string)?);
+    fn services_from_annotations(
+        &self,
+        annotations: BTreeMap<String, String>,
+        endpoint_ref: &Arc<EndpointRef>,
+        pod_name: &str,
+        pod_address: IpAddr,
+    ) -> Result<Vec<Service>> {
+        let mut services = Vec::new();
+        if let Some(services_string) = annotations.get(SERVICES_ANNOTATION) {
+            for service_string in services_string.split(',') {
+                services.push(self.parse_service_string(
+                    service_string,
+                    endpoint_ref,
+                    pod_name,
+                    pod_address,
+                ).with_context(|| format!("while parsing service string '{}' for pod {} ({}) from Kubernetes cluster: {}", service_string, pod_name, endpoint_ref.uid, self.name))?);
+            }
         }
-    }
 
-    if services.is_empty() {
-        Err(anyhow!("no services were defined"))
-    } else {
         Ok(services)
     }
+
+    // The format is very simple:
+    //
+    // <external-protocol>:<external-port>:<backend-protocol>:<backend-port>
+    //
+    // `<external-*>` refers to what the proxy accepts from the outside world, and `<backend-*>`
+    // refer to how the proxy communicates with the pod
+    fn parse_service_string(
+        &self,
+        service_string: &str,
+        endpoint_ref: &Arc<EndpointRef>,
+        pod_name: &str,
+        pod_address: IpAddr,
+    ) -> Result<Service> {
+        if service_string.split(':').count() > 4 {
+            warn!(
+                "{}: service definition '{}' for pod {} ({}) has garbage at the end",
+                self.name, pod_name, endpoint_ref.uid, service_string
+            );
+        }
+
+        let mut parts = service_string.split(':');
+        let parts = (parts.next(), parts.next(), parts.next(), parts.next())
+            .transpose();
+
+        match parts {
+            Some((
+                external_protocol,
+                external_port,
+                backend_protocol,
+                backend_port,
+            )) => Ok(Service::new(
+                external_protocol,
+                parse_port(external_port)?,
+                vec![(
+                    endpoint_ref.clone(),
+                    Endpoint::new(
+                        backend_protocol,
+                        (pod_address, parse_port(backend_port)?),
+                    ),
+                )],
+            )),
+            _ => Err(anyhow!("invalid service string")),
+        }
+    }
 }
 
-// The format is very simple: `<external-port>:<external-protocol>:<server-port>:<server-protocol>`
-// `<external-*>` refers to what the proxy accepts from the outside world, and `<server-*>`
-// refer to how the proxy communicates with the pod
-fn parse_service_string(service_string: &str) -> Result<ProxiedService> {
-    let mut split = service_string.split(':');
-    let parts = (split.next(), split.next(), split.next(), split.next()).transpose();
+pub fn register(
+    services: &mut Services,
+    config: KubernetesConfig,
+    namespace: Option<String>,
+) {
+    services.register_discovery_service(KubernetesDiscoveryService::new(
+        config, namespace,
+    ));
+}
 
-    match parts {
-        Some((external_port, external_protocol, server_port, server_protocol))
-            if split.next().is_none() =>
-        {
-            unimplemented!()
-        }
-        _ => Err(anyhow!("service string {} is invalid", service_string)),
-    }
+fn parse_port(port: &str) -> Result<u16> {
+    port.parse()
+        .with_context(|| format!("'{}' is not a port number", port))
 }

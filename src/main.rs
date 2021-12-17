@@ -1,120 +1,94 @@
-use crate::{backend::K8sConfig, matchmaking::Matchmaker};
-use anyhow::Result;
-use clap::{crate_authors, crate_description, crate_version, App, Arg, ArgMatches};
-use kube::Config as KubeConfig;
-use std::ffi::{OsStr, OsString};
+use crate::{backend::Services, matchmaking::Matchmaker};
+use anyhow::{anyhow, Context, Result};
+use clap::{crate_authors, crate_description, App, Arg, ArgMatches};
+use std::{
+    ffi::{OsStr, OsString},
+    process,
+};
 use tokio::runtime::{Builder, Runtime};
-use tracing::{warn, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::fmt::time::Uptime;
+
+#[cfg(feature = "discovery-kubernetes")]
+use crate::kubernetes::KubernetesConfig;
 
 mod backend;
 mod matchmaking;
+mod protocol;
 
 #[cfg(feature = "handover")]
 mod handover;
-#[cfg(feature = "http")]
+#[cfg(feature = "protocol-http")]
 mod http;
-#[cfg(feature = "kubernetes")]
+#[cfg(feature = "discovery-kubernetes")]
 mod kubernetes;
-#[cfg(feature = "ssh")]
+#[cfg(feature = "protocol-ssh")]
 mod ssh;
-#[cfg(feature = "websockets")]
+#[cfg(feature = "protocol-websockets")]
 mod websockets;
 
 static PROGRAM_NAME: &str = "State Proxy";
-
-static ARG_K8S_URL: &str = "k8s-url";
-static ARG_K8S_NAMESPACE: &str = "k8s-namespace";
-static ARG_INFER_K8S_CONFIG: &str = "infer-k8s-config";
-static ARG_WORKER_THREADS: &str = "worker-threads";
-
-#[cfg(feature = "handover")]
-static ARG_HANDOVER_SOCKET: &str = "handover-socket";
-
-#[cfg(feature = "http")]
-static ARG_ACCEPT_HTTP: &str = "accept-http";
-
-#[cfg(feature = "websockets")]
-static ARG_ACCEPT_WEBSOCKETS: &str = "accept-websockets";
-
-#[cfg(feature = "ssh")]
-static ARG_ACCEPT_SSH: &str = "accept-ssh";
+static PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
     let args = parse_command_line();
     init_logging();
-    // TODO: proper error handling and reporting
-    let mut matchmaker = Matchmaker::new();
-    let executor = init_executor(&args).unwrap();
-    #[cfg(feature = "handover")]
-    init_handover(&args, &executor);
-    #[cfg(feature = "http")]
-    init_http(&mut matchmaker, &args);
-    #[cfg(feature = "websockets")]
-    init_websockets(&mut matchmaker, &args);
-    #[cfg(feature = "ssh")]
-    init_ssh(&mut matchmaker, &args);
-    // TODO: Error handling here too
-    run_backend_communication(args, executor).unwrap();
-}
-
-fn init_logging() {
-    tracing_subscriber::fmt()
-        .with_timer(Uptime::default())
-        .with_thread_ids(true)
-        .with_max_level(Level::DEBUG)
-        .init();
+    if let Err(err) = run(args) {
+        error!("CRITICAL: {:?}", err);
+        process::exit(1);
+    }
 }
 
 fn parse_command_line() -> ArgMatches<'static> {
     let app = App::new(PROGRAM_NAME)
         .author(crate_authors!(", "))
-        .version(crate_version!())
+        .version(PROGRAM_VERSION)
         .about(crate_description!())
         .args(&[
-            Arg::with_name(ARG_K8S_URL)
-                .long(ARG_K8S_URL)
-                .takes_value(true)
-                .value_name("URL")
-                .required_unless(ARG_INFER_K8S_CONFIG)
-                .help("Connect to the Kubernetes cluster given by the URL."),
-            Arg::with_name(ARG_K8S_NAMESPACE)
-                .long(ARG_K8S_NAMESPACE)
-                .takes_value(true)
-                .value_name("NAMESPACE")
-                .requires(ARG_K8S_URL)
-                .help("List Kubernetes pods from the given namespace."),
-            Arg::with_name(ARG_INFER_K8S_CONFIG)
-                .short("k")
-                .long(ARG_INFER_K8S_CONFIG)
-                .conflicts_with(ARG_K8S_URL)
-                .required_unless(ARG_K8S_URL)
-                .help("Connect to a Kubernetes cluster and infer the configuration from the environment."),
-            Arg::with_name(ARG_WORKER_THREADS)
-                .long(ARG_WORKER_THREADS)
+            Arg::with_name("worker-threads")
+                .long("worker-threads")
                 .takes_value(true)
                 .value_name("COUNT")
                 .validator_os(arg_is_number)
                 .help("Number of worker threads to spawn. Defaults to the number of CPU threads if not specified."),
         ]);
+    #[cfg(feature = "discovery-kubernetes")]
+    let app = app.args(&[
+        Arg::with_name("k8s-url")
+            .long("k8s-url")
+            .takes_value(true)
+            .value_name("URL")
+            .conflicts_with("infer-k8s-config")
+            .help("Connect to the Kubernetes cluster given by the URL."),
+        Arg::with_name("k8s-namespace")
+            .long("k8s-namespace")
+            .takes_value(true)
+            .value_name("NAMESPACE")
+            .requires("k8s-url")
+            .help("List Kubernetes pods from the given namespace."),
+        Arg::with_name("infer-k8s-config")
+            .short("k")
+            .long("infer-k8s-config")
+            .help("Connect to the Kubernetes cluster inferred from the environment."),
+    ]);
+    #[cfg(feature = "protocol-http")]
+    let app = app.args(&[Arg::with_name("accept-http")
+        .long("accept-http")
+        .help("Accept external HTTP connections.")]);
+    #[cfg(feature = "protocol-ssh")]
+    let app = app.args(&[Arg::with_name("accept-ssh")
+        .long("accept-ssh")
+        .help("Accept external SSH connections.")]);
+    #[cfg(feature = "protocol-websockets")]
+    let app = app.args(&[Arg::with_name("accept-websockets")
+        .long("accept-websockets")
+        .help("Accept external websockets connections.")]);
     #[cfg(feature = "handover")]
-    let app = app.args(&[Arg::with_name(ARG_HANDOVER_SOCKET)
-        .long(ARG_HANDOVER_SOCKET)
+    let app = app.args(&[Arg::with_name("handover-socket")
+        .long("handover-socket")
         .takes_value(true)
         .value_name("ADDRESS")
         .help("Address of the Unix Domain Socket used for handover.")]);
-    #[cfg(feature = "http")]
-    let app = app.args(&[Arg::with_name(ARG_ACCEPT_HTTP)
-        .long(ARG_ACCEPT_HTTP)
-        .help("Accept external HTTP connections.")]);
-    #[cfg(feature = "websockets")]
-    let app = app.args(&[Arg::with_name(ARG_ACCEPT_WEBSOCKETS)
-        .long(ARG_ACCEPT_WEBSOCKETS)
-        .help("Accept external websockets connections.")]);
-    #[cfg(feature = "ssh")]
-    let app = app.args(&[Arg::with_name(ARG_ACCEPT_SSH)
-        .long(ARG_ACCEPT_SSH)
-        .help("Accept external SSH connections.")]);
 
     app.get_matches()
 }
@@ -130,62 +104,111 @@ fn arg_is_number(x: &OsStr) -> Result<(), OsString> {
     }
 }
 
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_timer(Uptime::default())
+        .with_thread_ids(true)
+        .with_max_level(Level::DEBUG)
+        .init();
+}
+
+fn run(args: ArgMatches) -> Result<()> {
+    info!("{} {} starting...", PROGRAM_NAME, PROGRAM_VERSION);
+
+    let executor = init_executor(&args).with_context(|| {
+        anyhow!("failed to initialize the asynchronous runtime")
+    })?;
+
+    let mut services = Services::new();
+    register_kubernetes(&mut services, &args)?;
+
+    let mut matchmaker = Matchmaker::new(services);
+    register_http(&mut matchmaker, &args);
+    register_ssh(&mut matchmaker, &args);
+    register_websockets(&mut matchmaker, &args);
+    init_handover(&args, &executor);
+
+    // No need to hold onto this anymore, so drop it to get a bit of memory back
+    drop(args);
+
+    info!("{} {} running", PROGRAM_NAME, PROGRAM_VERSION);
+
+    executor.block_on(matchmaker.run())
+}
+
 fn init_executor(args: &ArgMatches) -> Result<Runtime> {
     let mut builder = Builder::new_multi_thread();
     builder.enable_all();
-    if let Some(worker_threads) = args.value_of(ARG_WORKER_THREADS) {
+    if let Some(worker_threads) = args.value_of("worker-threads") {
         builder.worker_threads(worker_threads.parse().unwrap());
     }
 
     Ok(builder.build()?)
 }
 
-#[cfg(feature = "handover")]
-fn init_handover(args: &ArgMatches, executor: &Runtime) {
-    if let Some(handover_socket) = args.value_of(ARG_HANDOVER_SOCKET) {
-        executor.spawn(handover::run(handover_socket.to_owned()));
-    } else {
-        warn!(
-            "--{} not specified. This instance will not be able to send or receive state from other local instances",
-            ARG_HANDOVER_SOCKET,
+fn register_kubernetes(
+    _services: &mut Services,
+    _args: &ArgMatches,
+) -> Result<()> {
+    #[cfg(feature = "discovery-kubernetes")]
+    {
+        let config = if _args.is_present("infer-k8s-config") {
+            KubernetesConfig::Infer
+        } else if let Some(url) = _args.value_of("k8s-url") {
+            KubernetesConfig::Explicit {
+                url: url.try_into()?,
+            }
+        } else {
+            warn!("Neither --infer-k8s-config nor --k8s-url specified. Kubernetes discovery service disabled.");
+
+            return Ok(());
+        };
+        kubernetes::register(
+            _services,
+            config,
+            _args.value_of("k8s-namespace").map(|x| x.to_owned()),
         );
     }
-}
-
-#[cfg(feature = "http")]
-fn init_http(matchmaker: &mut Matchmaker, args: &ArgMatches) {
-    if args.is_present(ARG_ACCEPT_HTTP) {
-        http::register(matchmaker);
-    }
-}
-
-#[cfg(feature = "websockets")]
-fn init_websockets(matchmaker: &mut Matchmaker, args: &ArgMatches) {
-    if args.is_present(ARG_ACCEPT_WEBSOCKETS) {
-        websockets::register(matchmaker);
-    }
-}
-
-#[cfg(feature = "ssh")]
-fn init_ssh(matchmaker: &mut Matchmaker, args: &ArgMatches) {
-    if args.is_present(ARG_ACCEPT_SSH) {
-        ssh::register(matchmaker);
-    }
-}
-
-fn run_backend_communication(args: ArgMatches, executor: Runtime) -> Result<()> {
-    let config = if args.is_present(ARG_INFER_K8S_CONFIG) {
-        K8sConfig::Infer
-    } else {
-        let mut kube_config = KubeConfig::new(args.value_of(ARG_K8S_URL).unwrap().try_into()?);
-        if let Some(namespace) = args.value_of(ARG_K8S_NAMESPACE) {
-            kube_config.default_namespace = namespace.to_owned();
-        }
-
-        K8sConfig::Explicit(kube_config)
-    };
-    drop(args);
-    executor.block_on(backend::run_communication(config));
 
     Ok(())
+}
+
+fn register_http(_matchmaker: &mut Matchmaker, _args: &ArgMatches) {
+    #[cfg(feature = "protocol-http")]
+    {
+        if _args.is_present("accept-http") {
+            http::register(_matchmaker);
+        }
+    }
+}
+
+fn register_ssh(_matchmaker: &mut Matchmaker, _args: &ArgMatches) {
+    #[cfg(feature = "protocol-ssh")]
+    {
+        if _args.is_present("accept-ssh") {
+            ssh::register(_matchmaker);
+        }
+    }
+}
+
+fn register_websockets(_matchmaker: &mut Matchmaker, _args: &ArgMatches) {
+    #[cfg(feature = "protocol-websockets")]
+    {
+        if _args.is_present("accept-websockets") {
+            websockets::register(_matchmaker);
+        }
+    }
+}
+
+fn init_handover(_args: &ArgMatches, _executor: &Runtime) {
+    #[cfg(feature = "handover")]
+    {
+        if let Some(handover_socket) = _args.value_of("handover-socket") {
+            _executor.spawn(handover::run(handover_socket.to_owned()));
+        } else {
+            warn!(
+                "--handover-socket not specified. This instance will not be able to send or receive state from other local instances",
+            );
+        }
+    }
 }

@@ -1,13 +1,19 @@
-use crate::matchmaking::{
-    client::ProtocolClient,
-    server::{
-        NewConnectionReply, NewConnectionRequest, ProtocolServer, ServerConnectionState,
-        SocketStream,
+use crate::{
+    matchmaking::{
+        client::ProtocolClient,
+        server::{
+            NewConnectionReply, NewConnectionRequest, ProtocolServer,
+            ServerConnectionState, SocketStream,
+        },
+        Matchmaker, Message, MessageChannel,
     },
-    DuplexChannel, Matchmaker, Message, Protocol,
+    protocol::Protocol,
 };
+use anyhow::Result;
 use async_trait::async_trait;
-use hyper::{client::HttpConnector, service, Body, Client, Request, Response, Server};
+use hyper::{
+    client::HttpConnector, service, Body, Client, Request, Response, Server,
+};
 use hyper_tls::HttpsConnector;
 use std::{net::SocketAddr, result};
 use thiserror::Error;
@@ -19,7 +25,9 @@ use tokio::sync::{
 struct HttpProtocol;
 
 impl Protocol for HttpProtocol {
-    const NAME: &'static str = "http";
+    fn name(&self) -> &str {
+        "http"
+    }
 }
 
 struct HttpClient {
@@ -35,12 +43,19 @@ impl HttpClient {
 }
 
 #[async_trait]
-impl ProtocolClient<HttpProtocol> for HttpClient {
-    type Error = hyper::Error;
-    type Channel = HttpMessageChannel;
+impl ProtocolClient for HttpClient {
+    fn protocol(&self) -> &dyn Protocol {
+        &HttpProtocol
+    }
 
-    async fn connect(&self, addr: SocketAddr) -> Result<Self::Channel, Self::Error> {
-        Ok(Self::Channel::new(self.hyper_client.clone(), addr))
+    async fn connect(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<Box<dyn MessageChannel + Send>> {
+        Ok(Box::new(HttpMessageChannel::new(
+            self.hyper_client.clone(),
+            addr,
+        )))
     }
 }
 
@@ -58,10 +73,11 @@ impl HttpMessageChannel {
         tokio::spawn(async move {
             while let Some(msg) = request_recv.recv().await {
                 // TODO: Lots unimplemented here
-                let response = hyper_client.request(unimplemented!()).await.map(|x| {
-                    let (header, body) = x.into_parts();
-                    unimplemented!()
-                });
+                let response =
+                    hyper_client.request(unimplemented!()).await.map(|x| {
+                        let (header, body) = x.into_parts();
+                        unimplemented!()
+                    });
                 if response_send.send(response).await.is_err() {
                     return;
                 }
@@ -76,20 +92,18 @@ impl HttpMessageChannel {
 }
 
 #[async_trait]
-impl DuplexChannel<Message> for HttpMessageChannel {
-    type Error = HttpMessageChannelError;
-
-    async fn send(&self, msg: Message) -> result::Result<(), Self::Error> {
+impl MessageChannel for HttpMessageChannel {
+    async fn send(&self, msg: Message) -> Result<()> {
         match self.send.send(msg).await {
             Ok(_) => Ok(()),
-            Err(_) => Err(HttpMessageChannelError::Closed),
+            Err(_) => Err(HttpMessageChannelError::Closed.into()),
         }
     }
 
-    async fn recv(&self) -> result::Result<Message, Self::Error> {
+    async fn recv(&self) -> Result<Message> {
         match self.recv.lock().await.recv().await {
             Some(res) => res.map_err(|err| err.into()),
-            None => Err(HttpMessageChannelError::Closed),
+            None => Err(HttpMessageChannelError::Closed.into()),
         }
     }
 }
@@ -109,20 +123,30 @@ type HyperClient = Client<HttpsConnector<HttpConnector>, Body>;
 
 struct HttpServer;
 
-impl ProtocolServer<HttpProtocol> for HttpServer {
-    type Error = hyper::Error;
-
-    fn listen(&self, bind_to: SocketAddr, new_connection_send: Sender<NewConnectionRequest>) {
-        tokio::spawn(
-            Server::bind(&bind_to).serve(service::make_service_fn(|_| async move {
-                Ok::<_, hyper::Error>(service::service_fn(|request| async move {
-                    Ok::<_, hyper::Error>(Response::new(Body::from("UNIMPLEMENTED")))
-                }))
-            })),
-        );
+impl ProtocolServer for HttpServer {
+    fn protocol(&self) -> &dyn Protocol {
+        &HttpProtocol
     }
 
-    fn insert_state(&self, state: ServerConnectionState) -> result::Result<(), Self::Error> {
+    fn listen(
+        &self,
+        bind_to: SocketAddr,
+        new_connection_send: Sender<NewConnectionRequest>,
+    ) {
+        tokio::spawn(Server::bind(&bind_to).serve(service::make_service_fn(
+            |_| async move {
+                Ok::<_, hyper::Error>(service::service_fn(
+                    |request| async move {
+                        Ok::<_, hyper::Error>(Response::new(Body::from(
+                            "UNIMPLEMENTED",
+                        )))
+                    },
+                ))
+            },
+        )));
+    }
+
+    fn insert_state(&self, state: ServerConnectionState) -> Result<()> {
         unimplemented!()
     }
 

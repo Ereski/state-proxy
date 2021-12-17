@@ -1,5 +1,5 @@
-pub struct WebsocketHandle;
+use crate::matchmaking::Matchmaker;
 
-pub async fn run() {
+pub fn register(matchmaker: &mut Matchmaker) {
     unimplemented!("The websockets library needs to expose its internal state");
 }
