@@ -18,7 +18,6 @@ use tokio::{pin, sync::mpsc::Sender};
 use tracing::{error, info, warn};
 use tuple_transpose::TupleTranspose;
 
-static NAME: &str = "kubernetes";
 static API_VERSION_LABEL: &str = "state-proxy.io/use";
 static API_VERSION: &str = "v0";
 static SERVICES_ANNOTATION: &str = "state-proxy.io/services";
@@ -99,7 +98,7 @@ impl KubernetesDiscoveryService {
                 self.name
             )
         })? {
-            runtime.handle_pod_event(event).await;
+            runtime.handle_pod_event(event).await?;
         }
 
         Err(anyhow!(
@@ -151,11 +150,10 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
             Event::Deleted(pod) => {
                 if let Some(uid) = pod.metadata.uid {
                     self.known_pod_uids.remove(&uid);
-                    self.send
-                        .send(DiscoveryEvent::remove(Arc::new(
-                            EndpointRef::new(self.name.clone(), uid),
-                        )))
-                        .await;
+                    self.send(DiscoveryEvent::remove(Arc::new(
+                        EndpointRef::new(self.name.clone(), uid),
+                    )))
+                    .await?;
                 } else {
                     warn!(
                         "{}: Received a pod deletion event without the pod UID",
@@ -177,11 +175,10 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
                     mem::replace(&mut self.known_pod_uids, current_pod_uids);
                 for uid in old_pod_uids {
                     if !self.known_pod_uids.contains(&uid) {
-                        self.send
-                            .send(DiscoveryEvent::remove(Arc::new(
-                                EndpointRef::new(self.name.clone(), uid),
-                            )))
-                            .await;
+                        self.send(DiscoveryEvent::remove(Arc::new(
+                            EndpointRef::new(self.name.clone(), uid),
+                        )))
+                        .await?;
                     }
                 }
             }
@@ -227,37 +224,31 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
                                     self.name, name, endpoint_ref.uid
                                 );
                             } else {
-                                self.send
-                                    .send(DiscoveryEvent::add(
-                                        endpoint_ref,
-                                        services,
-                                    ))
-                                    .await;
+                                self.send(DiscoveryEvent::add(
+                                    endpoint_ref,
+                                    services,
+                                ))
+                                .await?;
                             }
                         } else {
-                            self.send
-                                .send(DiscoveryEvent::resume(endpoint_ref))
-                                .await;
+                            self.send(DiscoveryEvent::resume(endpoint_ref))
+                                .await?;
                         }
                     }
                     "Succeeded" => {
-                        self.send
-                            .send(DiscoveryEvent::remove(endpoint_ref))
-                            .await;
+                        self.send(DiscoveryEvent::remove(endpoint_ref)).await?;
                     }
                     "Failed" => {
-                        self.send
-                            .send(DiscoveryEvent::suspend(endpoint_ref))
-                            .await;
+                        self.send(DiscoveryEvent::suspend(endpoint_ref))
+                            .await?;
                     }
                     "Unknown" => {
                         warn!(
                             "{}: pod {} ({}) is in an unknown state. Suspending pod until the situation resolves",
                             self.name, name, endpoint_ref.uid
                         );
-                        self.send
-                            .send(DiscoveryEvent::suspend(endpoint_ref))
-                            .await;
+                        self.send(DiscoveryEvent::suspend(endpoint_ref))
+                            .await?;
                     }
                     // If the pod is only pending, we don't care
                     "Pending" => (),
@@ -266,15 +257,21 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
                             "{}: received an unknown pod status from Kubernetes for pod {} ({}): {}. Suspending pod until the situation resolves",
                             self.name, name, endpoint_ref.uid, unknown
                         );
-                        self.send
-                            .send(DiscoveryEvent::suspend(endpoint_ref))
-                            .await;
+                        self.send(DiscoveryEvent::suspend(endpoint_ref))
+                            .await?;
                     }
                 }
             }
         }
 
         Ok(())
+    }
+
+    async fn send(&self, event: DiscoveryEvent) -> Result<()> {
+        match self.send.send(event).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(anyhow!("channel closed")),
+        }
     }
 
     fn services_from_annotations(
@@ -349,10 +346,10 @@ pub fn register(
     services: &mut Services,
     config: KubernetesConfig,
     namespace: Option<String>,
-) {
+) -> Result<()> {
     services.register_discovery_service(KubernetesDiscoveryService::new(
         config, namespace,
-    ));
+    ))
 }
 
 fn parse_port(port: &str) -> Result<u16> {

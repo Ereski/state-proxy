@@ -123,9 +123,9 @@ fn run(args: ArgMatches) -> Result<()> {
     register_kubernetes(&mut services, &args)?;
 
     let mut matchmaker = Matchmaker::new(services);
-    register_http(&mut matchmaker, &args);
-    register_ssh(&mut matchmaker, &args);
-    register_websockets(&mut matchmaker, &args);
+    register_http(&mut matchmaker, &args)?;
+    register_ssh(&mut matchmaker, &args)?;
+    register_websockets(&mut matchmaker, &args)?;
     init_handover(&args, &executor);
 
     // No need to hold onto this anymore, so drop it to get a bit of memory back
@@ -167,37 +167,52 @@ fn register_kubernetes(
             _services,
             config,
             _args.value_of("k8s-namespace").map(|x| x.to_owned()),
-        );
+        )?;
     }
 
     Ok(())
 }
 
-fn register_http(_matchmaker: &mut Matchmaker, _args: &ArgMatches) {
+fn register_http(
+    _matchmaker: &mut Matchmaker,
+    _args: &ArgMatches,
+) -> Result<()> {
     #[cfg(feature = "protocol-http")]
     {
         if _args.is_present("accept-http") {
-            http::register(_matchmaker);
+            http::register(_matchmaker)?;
         }
     }
+
+    Ok(())
 }
 
-fn register_ssh(_matchmaker: &mut Matchmaker, _args: &ArgMatches) {
+fn register_ssh(
+    _matchmaker: &mut Matchmaker,
+    _args: &ArgMatches,
+) -> Result<()> {
     #[cfg(feature = "protocol-ssh")]
     {
         if _args.is_present("accept-ssh") {
-            ssh::register(_matchmaker);
+            ssh::register(_matchmaker)?;
         }
     }
+
+    Ok(())
 }
 
-fn register_websockets(_matchmaker: &mut Matchmaker, _args: &ArgMatches) {
+fn register_websockets(
+    _matchmaker: &mut Matchmaker,
+    _args: &ArgMatches,
+) -> Result<()> {
     #[cfg(feature = "protocol-websockets")]
     {
         if _args.is_present("accept-websockets") {
-            websockets::register(_matchmaker);
+            websockets::register(_matchmaker)?;
         }
     }
+
+    Ok(())
 }
 
 fn init_handover(_args: &ArgMatches, _executor: &Runtime) {

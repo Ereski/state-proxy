@@ -15,7 +15,7 @@ use hyper::{
     client::HttpConnector, service, Body, Client, Request, Response, Server,
 };
 use hyper_tls::HttpsConnector;
-use std::{net::SocketAddr, result};
+use std::net::SocketAddr;
 use thiserror::Error;
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -117,8 +117,6 @@ enum HttpMessageChannelError {
     Closed,
 }
 
-type HttpMessageChannelResult<T> = result::Result<T, HttpMessageChannelError>;
-
 type HyperClient = Client<HttpsConnector<HttpConnector>, Body>;
 
 struct HttpServer;
@@ -155,7 +153,9 @@ impl ProtocolServer for HttpServer {
     }
 }
 
-pub fn register(matchmaker: &mut Matchmaker) {
-    matchmaker.register_client(HttpClient::new());
-    matchmaker.register_server(HttpServer);
+pub fn register(matchmaker: &mut Matchmaker) -> Result<()> {
+    matchmaker.register_client(HttpClient::new())?;
+    matchmaker.register_server(HttpServer)?;
+
+    Ok(())
 }
