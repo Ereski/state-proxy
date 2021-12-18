@@ -1,3 +1,4 @@
+use crate::matchmaking::Matchmaker;
 use anyhow::{anyhow, Result};
 use std::{
     collections::{HashMap, HashSet},
@@ -10,15 +11,28 @@ use tokio::sync::{
 };
 use tracing::info;
 
-#[derive(Default)]
-pub struct Services {
+#[cfg(test)]
+mod test;
+
+// How many `DiscoveryEvent`s can be buffered before a `DiscoveryService` will have to wait.
+// Events are pretty small so we can se this high to deal with spikes
+const DISCOVERY_EVENT_BUFFER_SIZE: usize = 1024;
+
+pub struct ServiceManager {
+    matchmaker: Matchmaker,
+
     registered_discovery_services: HashSet<Arc<String>>,
-    external_port_map: Arc<Mutex<HashMap<u16, Service>>>,
+    services: Arc<Mutex<HashMap<u16, Service>>>,
 }
 
-impl Services {
-    pub fn new() -> Self {
-        Self::default()
+impl ServiceManager {
+    pub fn new(matchmaker: Matchmaker) -> Self {
+        Self {
+            matchmaker,
+
+            registered_discovery_services: HashSet::new(),
+            services: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn register_discovery_service<D>(
@@ -36,7 +50,7 @@ impl Services {
                 name
             ))
         } else {
-            let (send, recv) = mpsc::channel(10);
+            let (send, recv) = mpsc::channel(DISCOVERY_EVENT_BUFFER_SIZE);
             discovery_service.run_with_sender(send);
             self.listen_on(name.clone(), recv);
             info!("New discovery service registered: {}", name);
@@ -47,12 +61,16 @@ impl Services {
     }
 
     fn listen_on(&self, name: Arc<String>, mut recv: Receiver<DiscoveryEvent>) {
-        let external_port_map = self.external_port_map.clone();
+        let services = self.services.clone();
         tokio::spawn(async move {
             while let Some(event) = recv.recv().await {
                 unimplemented!();
             }
         });
+    }
+
+    pub async fn run(self) -> Result<()> {
+        unimplemented!()
     }
 }
 
@@ -96,6 +114,7 @@ impl DiscoveryEvent {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Service {
     pub protocol: String,
     pub port: u16,
@@ -119,7 +138,7 @@ impl Service {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EndpointRef {
     pub discovery_service: Arc<String>,
     pub uid: String,
@@ -137,6 +156,7 @@ impl EndpointRef {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
     pub protocol: String,
     pub address: SocketAddr,

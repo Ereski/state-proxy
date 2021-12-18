@@ -1,7 +1,4 @@
-use crate::{
-    backend::Services,
-    matchmaking::{client::ProtocolClient, server::ProtocolServer},
-};
+use crate::matchmaking::{client::ProtocolClient, server::ProtocolServer};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::collections::{hash_map::Entry, HashMap};
@@ -13,15 +10,13 @@ pub mod server;
 
 /// Struct responsible for matching external clients with internal servers.
 pub struct Matchmaker {
-    services: Services,
     clients: HashMap<String, Box<dyn ProtocolClient + Send + Sync>>,
     servers: HashMap<String, Box<dyn ProtocolServer + Send + Sync>>,
 }
 
 impl Matchmaker {
-    pub fn new(services: Services) -> Self {
+    pub fn new() -> Self {
         Self {
-            services,
             clients: HashMap::new(),
             servers: HashMap::new(),
         }
@@ -61,10 +56,6 @@ impl Matchmaker {
                 entry.key()
             )),
         }
-    }
-
-    pub async fn run(self) -> Result<()> {
-        unimplemented!()
     }
 }
 

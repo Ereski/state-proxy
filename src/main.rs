@@ -1,4 +1,4 @@
-use crate::{backend::Services, matchmaking::Matchmaker};
+use crate::{backend::ServiceManager, matchmaking::Matchmaker};
 use anyhow::{anyhow, Context, Result};
 use clap::{crate_authors, crate_description, App, Arg, ArgMatches};
 use std::{
@@ -119,21 +119,21 @@ fn run(args: ArgMatches) -> Result<()> {
         anyhow!("failed to initialize the asynchronous runtime")
     })?;
 
-    let mut services = Services::new();
-    register_kubernetes(&mut services, &args)?;
-
-    let mut matchmaker = Matchmaker::new(services);
+    let mut matchmaker = Matchmaker::new();
     register_http(&mut matchmaker, &args)?;
     register_ssh(&mut matchmaker, &args)?;
     register_websockets(&mut matchmaker, &args)?;
     init_handover(&args, &executor);
+
+    let mut service_manager = ServiceManager::new(matchmaker);
+    register_kubernetes(&mut service_manager, &args)?;
 
     // No need to hold onto this anymore, so drop it to get a bit of memory back
     drop(args);
 
     info!("{} {} running", PROGRAM_NAME, PROGRAM_VERSION);
 
-    executor.block_on(matchmaker.run())
+    executor.block_on(service_manager.run())
 }
 
 fn init_executor(args: &ArgMatches) -> Result<Runtime> {
@@ -147,7 +147,7 @@ fn init_executor(args: &ArgMatches) -> Result<Runtime> {
 }
 
 fn register_kubernetes(
-    _services: &mut Services,
+    _service_manager: &mut ServiceManager,
     _args: &ArgMatches,
 ) -> Result<()> {
     #[cfg(feature = "discovery-kubernetes")]
@@ -164,7 +164,7 @@ fn register_kubernetes(
             return Ok(());
         };
         kubernetes::register(
-            _services,
+            _service_manager,
             config,
             _args.value_of("k8s-namespace").map(|x| x.to_owned()),
         )?;

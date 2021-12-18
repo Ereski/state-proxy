@@ -1,5 +1,6 @@
 use crate::backend::{
-    DiscoveryEvent, DiscoveryService, Endpoint, EndpointRef, Service, Services,
+    DiscoveryEvent, DiscoveryService, Endpoint, EndpointRef, Service,
+    ServiceManager,
 };
 use anyhow::{anyhow, Context, Result};
 use futures::TryStreamExt;
@@ -343,11 +344,11 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
 }
 
 pub fn register(
-    services: &mut Services,
+    manager: &mut ServiceManager,
     config: KubernetesConfig,
     namespace: Option<String>,
 ) -> Result<()> {
-    services.register_discovery_service(KubernetesDiscoveryService::new(
+    manager.register_discovery_service(KubernetesDiscoveryService::new(
         config, namespace,
     ))
 }
