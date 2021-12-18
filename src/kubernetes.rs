@@ -9,6 +9,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::{
     api::ListParams, runtime, runtime::watcher::Event, Api, Client, Config,
 };
+use maplit::hashmap;
 use std::{
     collections::{BTreeMap, HashSet},
     mem,
@@ -330,27 +331,29 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
             )) => Ok(Service::new(
                 external_protocol,
                 parse_port(external_port)?,
-                vec![(
-                    endpoint_ref.clone(),
-                    Endpoint::new(
+                hashmap! {
+                    endpoint_ref.clone() => Endpoint::new(
+                        true,
                         backend_protocol,
                         (pod_address, parse_port(backend_port)?),
                     ),
-                )],
+                },
             )),
             _ => Err(anyhow!("invalid service string")),
         }
     }
 }
 
-pub fn register(
-    manager: &mut ServiceManager,
+pub async fn register(
+    manager: &Arc<ServiceManager>,
     config: KubernetesConfig,
     namespace: Option<String>,
 ) -> Result<()> {
-    manager.register_discovery_service(KubernetesDiscoveryService::new(
-        config, namespace,
-    ))
+    manager
+        .register_discovery_service(KubernetesDiscoveryService::new(
+            config, namespace,
+        ))
+        .await
 }
 
 fn parse_port(port: &str) -> Result<u16> {

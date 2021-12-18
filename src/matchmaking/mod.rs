@@ -1,7 +1,13 @@
-use crate::matchmaking::{client::ProtocolClient, server::ProtocolServer};
+use crate::{
+    backend::ServiceManager,
+    matchmaking::{client::ProtocolClient, server::ProtocolServer},
+};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use std::collections::{hash_map::Entry, HashMap};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    sync::Arc,
+};
 use tokio::io::AsyncRead;
 use tracing::info;
 
@@ -10,15 +16,19 @@ pub mod server;
 
 /// Struct responsible for matching external clients with internal servers.
 pub struct Matchmaker {
-    clients: HashMap<String, Box<dyn ProtocolClient + Send + Sync>>,
-    servers: HashMap<String, Box<dyn ProtocolServer + Send + Sync>>,
+    service_manager: Arc<ServiceManager>,
+
+    protocol_clients: HashMap<String, Box<dyn ProtocolClient + Send + Sync>>,
+    protocol_servers: HashMap<String, Box<dyn ProtocolServer + Send + Sync>>,
 }
 
 impl Matchmaker {
-    pub fn new() -> Self {
+    pub fn new(service_manager: Arc<ServiceManager>) -> Self {
         Self {
-            clients: HashMap::new(),
-            servers: HashMap::new(),
+            service_manager,
+
+            protocol_clients: HashMap::new(),
+            protocol_servers: HashMap::new(),
         }
     }
 
@@ -26,7 +36,10 @@ impl Matchmaker {
     where
         C: ProtocolClient + Send + Sync + 'static,
     {
-        match self.clients.entry(client.protocol().name().to_owned()) {
+        match self
+            .protocol_clients
+            .entry(client.protocol().name().to_owned())
+        {
             Entry::Vacant(entry) => {
                 info!("Client registered for {}", entry.key());
                 entry.insert(Box::new(client));
@@ -44,7 +57,10 @@ impl Matchmaker {
     where
         S: ProtocolServer + Send + Sync + 'static,
     {
-        match self.servers.entry(server.protocol().name().to_owned()) {
+        match self
+            .protocol_servers
+            .entry(server.protocol().name().to_owned())
+        {
             Entry::Vacant(entry) => {
                 info!("Server registered for {}", entry.key());
                 entry.insert(Box::new(server));
@@ -56,6 +72,10 @@ impl Matchmaker {
                 entry.key()
             )),
         }
+    }
+
+    pub async fn run(self) -> Result<()> {
+        unimplemented!()
     }
 }
 

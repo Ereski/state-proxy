@@ -4,6 +4,7 @@ use clap::{crate_authors, crate_description, App, Arg, ArgMatches};
 use std::{
     ffi::{OsStr, OsString},
     process,
+    sync::Arc,
 };
 use tokio::runtime::{Builder, Runtime};
 use tracing::{error, info, warn, Level};
@@ -115,25 +116,27 @@ fn init_logging() {
 fn run(args: ArgMatches) -> Result<()> {
     info!("{} {} starting...", PROGRAM_NAME, PROGRAM_VERSION);
 
-    let executor = init_executor(&args).with_context(|| {
-        anyhow!("failed to initialize the asynchronous runtime")
-    })?;
+    init_executor(&args)
+        .with_context(|| {
+            anyhow!("failed to initialize the asynchronous runtime")
+        })?
+        .block_on(async move {
+            let service_manager = ServiceManager::new();
+            register_kubernetes(&service_manager, &args).await?;
 
-    let mut matchmaker = Matchmaker::new();
-    register_http(&mut matchmaker, &args)?;
-    register_ssh(&mut matchmaker, &args)?;
-    register_websockets(&mut matchmaker, &args)?;
-    init_handover(&args, &executor);
+            let mut matchmaker = Matchmaker::new(service_manager);
+            register_http(&mut matchmaker, &args)?;
+            register_ssh(&mut matchmaker, &args)?;
+            register_websockets(&mut matchmaker, &args)?;
+            init_handover(&args);
 
-    let mut service_manager = ServiceManager::new(matchmaker);
-    register_kubernetes(&mut service_manager, &args)?;
+            // No need to hold onto this anymore, so drop it to get a bit of memory back
+            drop(args);
 
-    // No need to hold onto this anymore, so drop it to get a bit of memory back
-    drop(args);
+            info!("{} {} running", PROGRAM_NAME, PROGRAM_VERSION);
 
-    info!("{} {} running", PROGRAM_NAME, PROGRAM_VERSION);
-
-    executor.block_on(service_manager.run())
+            matchmaker.run().await
+        })
 }
 
 fn init_executor(args: &ArgMatches) -> Result<Runtime> {
@@ -146,9 +149,9 @@ fn init_executor(args: &ArgMatches) -> Result<Runtime> {
     Ok(builder.build()?)
 }
 
-fn register_kubernetes(
-    _service_manager: &mut ServiceManager,
-    _args: &ArgMatches,
+async fn register_kubernetes(
+    _service_manager: &Arc<ServiceManager>,
+    _args: &ArgMatches<'_>,
 ) -> Result<()> {
     #[cfg(feature = "discovery-kubernetes")]
     {
@@ -164,10 +167,11 @@ fn register_kubernetes(
             return Ok(());
         };
         kubernetes::register(
-            _service_manager,
+            &_service_manager,
             config,
             _args.value_of("k8s-namespace").map(|x| x.to_owned()),
-        )?;
+        )
+        .await?;
     }
 
     Ok(())
@@ -215,11 +219,11 @@ fn register_websockets(
     Ok(())
 }
 
-fn init_handover(_args: &ArgMatches, _executor: &Runtime) {
+fn init_handover(_args: &ArgMatches) {
     #[cfg(feature = "handover")]
     {
         if let Some(handover_socket) = _args.value_of("handover-socket") {
-            _executor.spawn(handover::run(handover_socket.to_owned()));
+            tokio::spawn(handover::run(handover_socket.to_owned()));
         } else {
             warn!(
                 "--handover-socket not specified. This instance will not be able to send or receive state from other local instances",

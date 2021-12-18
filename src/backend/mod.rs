@@ -1,5 +1,5 @@
-use crate::matchmaking::Matchmaker;
 use anyhow::{anyhow, Result};
+use metered::{measure, HitCount, Throughput};
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -15,62 +15,96 @@ use tracing::info;
 mod test;
 
 // How many `DiscoveryEvent`s can be buffered before a `DiscoveryService` will have to wait.
-// Events are pretty small so we can se this high to deal with spikes
+// Events are pretty small so we can set this high to deal with spikes
 const DISCOVERY_EVENT_BUFFER_SIZE: usize = 1024;
 
+// Use locktree here to ensure deadlock-freedom
 pub struct ServiceManager {
-    matchmaker: Matchmaker,
+    registered_discovery_services: Mutex<HashSet<Arc<String>>>,
+    services: Mutex<HashMap<u16, Service>>,
 
-    registered_discovery_services: HashSet<Arc<String>>,
-    services: Arc<Mutex<HashMap<u16, Service>>>,
+    discovery_service_metrics:
+        Mutex<HashMap<Arc<String>, Arc<DiscoveryServiceMetrics>>>,
 }
 
 impl ServiceManager {
-    pub fn new(matchmaker: Matchmaker) -> Self {
-        Self {
-            matchmaker,
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            registered_discovery_services: Mutex::new(HashSet::new()),
+            services: Mutex::new(HashMap::new()),
 
-            registered_discovery_services: HashSet::new(),
-            services: Arc::new(Mutex::new(HashMap::new())),
-        }
+            discovery_service_metrics: Mutex::new(HashMap::new()),
+        })
     }
 
-    pub fn register_discovery_service<D>(
-        &mut self,
+    pub async fn register_discovery_service<D>(
+        self: &Arc<Self>,
         discovery_service: D,
     ) -> Result<()>
     where
         D: DiscoveryService + Send + Sync + 'static,
     {
         let name = discovery_service.name();
+        let mut registered_discovery_services =
+            self.registered_discovery_services.lock().await;
+        let mut discovery_service_metrics =
+            self.discovery_service_metrics.lock().await;
 
-        if self.registered_discovery_services.contains(&name) {
+        if registered_discovery_services.contains(&name) {
             Err(anyhow!(
                 "the discovery service {} is already registered",
                 name
             ))
         } else {
+            let metrics = Arc::new(DiscoveryServiceMetrics::new());
+            discovery_service_metrics.insert(name.clone(), metrics.clone());
+
             let (send, recv) = mpsc::channel(DISCOVERY_EVENT_BUFFER_SIZE);
             discovery_service.run_with_sender(send);
-            self.listen_on(name.clone(), recv);
+            tokio::spawn(self.clone().listen_for_discovery_events(
+                name.clone(),
+                metrics,
+                recv,
+            ));
+            registered_discovery_services.insert(name.clone());
+
             info!("New discovery service registered: {}", name);
-            self.registered_discovery_services.insert(name);
 
             Ok(())
         }
     }
 
-    fn listen_on(&self, name: Arc<String>, mut recv: Receiver<DiscoveryEvent>) {
-        let services = self.services.clone();
-        tokio::spawn(async move {
-            while let Some(event) = recv.recv().await {
-                unimplemented!();
-            }
-        });
+    async fn listen_for_discovery_events(
+        self: Arc<Self>,
+        name: Arc<String>,
+        metrics: Arc<DiscoveryServiceMetrics>,
+        mut recv: Receiver<DiscoveryEvent>,
+    ) {
+        while let Some(event) = recv.recv().await {
+            measure!(
+                &metrics.events_processed,
+                measure!(
+                    &metrics.event_throughput,
+                    self.process_event(&name, event).await
+                )
+            );
+        }
     }
 
-    pub async fn run(self) -> Result<()> {
+    async fn process_event(&self, name: &str, event: DiscoveryEvent) {
         unimplemented!()
+    }
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryServiceMetrics {
+    event_throughput: Throughput,
+    events_processed: HitCount,
+}
+
+impl DiscoveryServiceMetrics {
+    fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -118,14 +152,14 @@ impl DiscoveryEvent {
 pub struct Service {
     pub protocol: String,
     pub port: u16,
-    pub endpoints: Vec<(Arc<EndpointRef>, Endpoint)>,
+    pub endpoints: HashMap<Arc<EndpointRef>, Endpoint>,
 }
 
 impl Service {
     pub fn new<P>(
         protocol: P,
         port: u16,
-        endpoints: Vec<(Arc<EndpointRef>, Endpoint)>,
+        endpoints: HashMap<Arc<EndpointRef>, Endpoint>,
     ) -> Self
     where
         P: ToString,
@@ -158,17 +192,19 @@ impl EndpointRef {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
+    pub is_available: bool,
     pub protocol: String,
     pub address: SocketAddr,
 }
 
 impl Endpoint {
-    pub fn new<P, A>(protocol: P, address: A) -> Self
+    pub fn new<P, A>(is_available: bool, protocol: P, address: A) -> Self
     where
         P: ToString,
         A: Into<SocketAddr>,
     {
         Self {
+            is_available,
             protocol: protocol.to_string(),
             address: address.into(),
         }
