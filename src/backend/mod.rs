@@ -228,7 +228,7 @@ impl ServiceManager {
                         service.endpoints.get_mut(&endpoint_id)
                     {
                         found = true;
-                        if endpoint.is_available {
+                        if !endpoint.is_available {
                             endpoint.is_available = true;
                             info!(
                                 "Resumed endpoint '{}' ({}) for service on port {} ({})",
