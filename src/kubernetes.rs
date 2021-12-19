@@ -1,13 +1,11 @@
-use crate::backend::{
-    discovery::{DiscoveryEvent, ServiceDiscovery},
-    ServiceManager,
-};
+use crate::backend::discovery::{DiscoveryEvent, ServiceDiscovery};
 use anyhow::{anyhow, Context, Result};
 use futures::TryStreamExt;
 use http::Uri;
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
-    api::ListParams, runtime, runtime::watcher::Event, Api, Client, Config,
+    api::ListParams, config::KubeConfigOptions, runtime,
+    runtime::watcher::Event, Api, Client, Config,
 };
 use std::{
     collections::{BTreeMap, HashSet},
@@ -19,63 +17,69 @@ use tokio::{pin, sync::mpsc::Sender};
 use tracing::{error, info, warn};
 use tuple_transpose::TupleTranspose;
 
-static API_VERSION_LABEL: &str = "state-proxy.io/use";
-static API_VERSION: &str = "v0";
-static SERVICES_ANNOTATION: &str = "state-proxy.io/services";
+pub static API_VERSION_LABEL: &str = "state-proxy.io/use";
+pub static API_VERSION: &str = "v0";
+pub static SERVICES_ANNOTATION: &str = "state-proxy.io/services";
 
 pub enum KubernetesConfig {
-    Infer,
+    KubeConfig { context: Option<String> },
     Explicit { url: Uri },
 }
 
-struct KubernetesServiceDiscovery {
+pub struct KubernetesServiceDiscovery {
     name: Arc<String>,
 
-    config: KubernetesConfig,
+    config: Config,
     namespace: String,
 }
 
 impl KubernetesServiceDiscovery {
-    fn new(config: KubernetesConfig, namespace: Option<String>) -> Self {
+    pub async fn new(
+        config: KubernetesConfig,
+        namespace: Option<String>,
+    ) -> Result<Self> {
         let namespace = namespace.unwrap_or_else(|| "default".to_owned());
-        let name = match &config {
-            KubernetesConfig::Infer => format!("kubernetes/{}", namespace),
+        let config = match config {
+            KubernetesConfig::KubeConfig { context } => {
+                Config::from_kubeconfig(&KubeConfigOptions {
+                    context,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|x| x.into())
+            },
             KubernetesConfig::Explicit { url } => {
-                format!("kubernetes/{}/{}", url, namespace)
+                // URI must have a scheme otherwise the client initialization will panic instead of
+                // erroring out. Check that here to avoid user-unfriendly errors
+                if url.scheme().is_some() {
+                    Ok(Config::new(url))
+                } else {
+                    Err(anyhow!(
+                        "Kubernetes cluster URL must have a scheme component"
+                    ))
+                }
             }
-        };
+        }.context("while trying to get the connection parameters to the Kubernetes cluster")?;
+        let name = format!("kubernetes@{}/{}", config.cluster_url, namespace);
 
-        Self {
+        Ok(Self {
             name: Arc::new(name),
 
             config,
             namespace,
-        }
+        })
     }
 
     async fn run(self, send: Sender<DiscoveryEvent>) -> Result<()> {
-        let client = if let KubernetesConfig::Explicit { url } = self.config {
-            // URI must have a scheme otherwise the client initialization will panic instead of
-            // erroring out. Check that here to avoid user-unfriendly errors
-            if url.scheme().is_none() {
-                return Err(anyhow!(
-                    "Kubernetes cluster URL must have a scheme component"
-                ));
-            }
-
-            info!(
-                "Connecting to the Kubernetes cluster at {}",
-                url
-            );
-
-            Client::try_from(Config::new(url))
-        } else {
-            info!("Connecting to the Kubernetes cluster specified by the environment");
-
-            Client::try_default().await
-        }
-        .with_context(|| {
-            format!("while trying to connect to the Kubernetes cluster: {}", self.name)
+        info!(
+            "Connecting to the Kubernetes cluster at {}",
+            self.config.cluster_url
+        );
+        let client = Client::try_from(self.config).with_context(|| {
+            format!(
+                "while trying to connect to the Kubernetes cluster: {}",
+                self.name
+            )
         })?;
 
         info!("{}: Watching pods", self.name);
@@ -144,14 +148,13 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
         match event {
             Event::Applied(pod) => {
                 if let Some(uid) = &pod.metadata.uid {
-                    let is_new = self.known_pod_uids.insert(uid.to_owned());
-                    self.apply_pod(pod, is_new).await?;
+                    self.apply_pod(pod).await?;
                 }
             }
             Event::Deleted(pod) => {
                 if let Some(uid) = pod.metadata.uid {
                     self.known_pod_uids.remove(&uid);
-                    self.send(DiscoveryEvent::remove(uid)).await?;
+                    self.send(DiscoveryEvent::delete(uid)).await?;
                 } else {
                     warn!(
                         "{}: Received a pod deletion event without the pod UID",
@@ -163,9 +166,8 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
                 let mut current_pod_uids = HashSet::new();
                 for pod in pods {
                     if let Some(uid) = &pod.metadata.uid {
-                        let is_new = self.known_pod_uids.contains(uid);
                         current_pod_uids.insert(uid.to_owned());
-                        self.apply_pod(pod, is_new).await?;
+                        self.apply_pod(pod).await?;
                     }
                 }
 
@@ -173,7 +175,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
                     mem::replace(&mut self.known_pod_uids, current_pod_uids);
                 for uid in old_pod_uids {
                     if !self.known_pod_uids.contains(&uid) {
-                        self.send(DiscoveryEvent::remove(uid)).await?;
+                        self.send(DiscoveryEvent::delete(uid)).await?;
                     }
                 }
             }
@@ -182,7 +184,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
         Ok(())
     }
 
-    async fn apply_pod(&self, pod: Pod, is_new: bool) -> Result<()> {
+    async fn apply_pod(&mut self, pod: Pod) -> Result<()> {
         if let Some(status) = pod.status {
             // Take everything we care about out of those endless `Option`s
             let meta = pod.metadata;
@@ -202,22 +204,23 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
                     )
                 })?;
 
+                if self.known_pod_uids.insert(uid.to_owned()) {
+                    self.discover_services(
+                        annotations,
+                        uid.clone(),
+                        &name,
+                        address,
+                    )
+                    .await?;
+                }
+
                 match phase.as_ref() {
                     "Running" => {
-                        if is_new {
-                            self.discover_services(
-                                annotations,
-                                uid,
-                                &name,
-                                address,
-                            )
-                            .await?;
-                        } else {
-                            self.send(DiscoveryEvent::resume(uid)).await?;
-                        }
+                        self.send(DiscoveryEvent::resume(uid)).await?;
                     }
                     "Succeeded" => {
-                        self.send(DiscoveryEvent::remove(uid)).await?;
+                        self.known_pod_uids.remove(&uid);
+                        self.send(DiscoveryEvent::delete(uid)).await?;
                     }
                     "Failed" => {
                         self.send(DiscoveryEvent::suspend(uid)).await?;
@@ -252,15 +255,26 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
         pod_name: &str,
         pod_address: IpAddr,
     ) -> Result<()> {
+        let mut has_service = false;
         if let Some(services_string) = annotations.get(SERVICES_ANNOTATION) {
             for service_string in services_string.split(',') {
+                has_service = true;
+
                 self.send_service_from_string(
                     service_string,
                     uid.clone(),
                     pod_name,
                     pod_address,
-                ).await.with_context(|| format!("while handling service string '{}' for pod {} ({}) from Kubernetes cluster: {}", service_string, pod_name, uid, self.name))?;
+                ).await.with_context(|| {
+                    format!(
+                        "while handling service string '{}' for pod {} ({}) from Kubernetes cluster: {}", service_string, pod_name, uid, self.name
+                    )
+                })?;
             }
+        }
+
+        if !has_service {
+            warn!("pod {} ({}) does not define any services", pod_name, uid);
         }
 
         Ok(())
@@ -299,7 +313,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
             )) => {
                 self.send(DiscoveryEvent::add(
                     uid,
-                    true,
+                    false,
                     parse_port(external_port)?,
                     external_protocol,
                     (pod_address, parse_port(backend_port)?),
@@ -319,18 +333,6 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
             Err(_) => Err(anyhow!("channel closed")),
         }
     }
-}
-
-pub async fn register(
-    manager: &Arc<ServiceManager>,
-    config: KubernetesConfig,
-    namespace: Option<String>,
-) -> Result<()> {
-    manager
-        .register_service_discovery(KubernetesServiceDiscovery::new(
-            config, namespace,
-        ))
-        .await
 }
 
 fn parse_port(port: &str) -> Result<u16> {

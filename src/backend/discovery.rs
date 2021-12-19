@@ -7,6 +7,7 @@ pub trait ServiceDiscovery {
     fn run_with_sender(self, send: Sender<DiscoveryEvent>);
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum DiscoveryEvent {
     Add {
         uid: String,
@@ -16,7 +17,7 @@ pub enum DiscoveryEvent {
         backend_address: SocketAddr,
         backend_protocol: String,
     },
-    Remove {
+    Delete {
         uid: String,
     },
     Suspend {
@@ -52,11 +53,11 @@ impl DiscoveryEvent {
         }
     }
 
-    pub fn remove<U>(uid: U) -> Self
+    pub fn delete<U>(uid: U) -> Self
     where
         U: Into<String>,
     {
-        Self::Remove { uid: uid.into() }
+        Self::Delete { uid: uid.into() }
     }
 
     pub fn suspend<U>(uid: U) -> Self

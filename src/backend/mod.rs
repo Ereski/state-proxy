@@ -160,26 +160,26 @@ impl ServiceManager {
                     }
                 }
             }
-            DiscoveryEvent::Remove { uid } => {
+            DiscoveryEvent::Delete { uid } => {
                 let endpoint_id = EndpointId::new(from, uid);
                 let mut found = false;
-                let mut services_to_remove = Vec::new();
+                let mut services_to_delete = Vec::new();
                 for (port, service) in &mut *port_service_map {
                     if service.endpoints.remove(&endpoint_id).is_some() {
                         found = true;
                         info!(
-                            "Removed endpoint '{}' ({}) for service on port {} ({})",
+                            "Deleted endpoint '{}' ({}) for service on port {} ({})",
                             endpoint_id.uid, endpoint_id.service_discovery_name, service.port,
                             service.protocol
                         );
                     }
 
                     if service.endpoints.is_empty() {
-                        services_to_remove.push(*port);
+                        services_to_delete.push(*port);
                     }
                 }
 
-                for port in services_to_remove {
+                for port in services_to_delete {
                     let old_service = port_service_map.remove(&port).unwrap();
                     info!(
                         "Stopped serving on port {} ({}): no endpoint",
@@ -189,7 +189,7 @@ impl ServiceManager {
 
                 if !found {
                     warn!(
-                        "Received a DiscoveryEvent::Remove from '{}' for an unknown endpoint: {}",
+                        "Received a DiscoveryEvent::Delete from '{}' for an unknown endpoint: {}",
                         endpoint_id.service_discovery_name, endpoint_id.uid
                     );
                 }

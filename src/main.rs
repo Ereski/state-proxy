@@ -11,7 +11,7 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::fmt::time::Uptime;
 
 #[cfg(feature = "discovery-kubernetes")]
-use crate::kubernetes::KubernetesConfig;
+use crate::kubernetes::{KubernetesConfig, KubernetesServiceDiscovery};
 
 mod backend;
 mod matchmaking;
@@ -55,22 +55,27 @@ fn parse_command_line() -> ArgMatches<'static> {
         ]);
     #[cfg(feature = "discovery-kubernetes")]
     let app = app.args(&[
-        Arg::with_name("k8s-url")
-            .long("k8s-url")
-            .takes_value(true)
-            .value_name("URL")
-            .conflicts_with("infer-k8s-config")
-            .help("Connect to the Kubernetes cluster given by the URL."),
         Arg::with_name("k8s-namespace")
             .long("k8s-namespace")
             .takes_value(true)
             .value_name("NAMESPACE")
-            .requires("k8s-url")
             .help("List Kubernetes pods from the given namespace."),
-        Arg::with_name("infer-k8s-config")
+        Arg::with_name("k8s-url")
+            .long("k8s-url")
+            .takes_value(true)
+            .value_name("URL")
+            .help("Connect to the Kubernetes cluster given by the URL."),
+        Arg::with_name("k8s-from-kubeconfig")
             .short("k")
-            .long("infer-k8s-config")
-            .help("Connect to the Kubernetes cluster inferred from the environment."),
+            .long("k8s-from-kubeconfig")
+            .conflicts_with("k8s-url")
+            .help("Connect to the Kubernetes cluster defined by a configuration file pointed by the `KUBECONFIG` environment variable, or `~/.kube/config` is `KUBECONFIG` is not set."),
+            Arg::with_name("k8s-context")
+                .long("k8s-context")
+                .takes_value(true)
+                .value_name("CONTEXT")
+                .requires("k8s-context")
+                .help("Use the given context, When reading from a configuration file."),
     ]);
     #[cfg(feature = "protocol-http")]
     let app = app.args(&[Arg::with_name("accept-http")
@@ -155,23 +160,28 @@ async fn register_kubernetes(
 ) -> Result<()> {
     #[cfg(feature = "discovery-kubernetes")]
     {
-        let config = if _args.is_present("infer-k8s-config") {
-            KubernetesConfig::Infer
+        let config = if _args.is_present("k8s-from-kubeconfig") {
+            KubernetesConfig::KubeConfig {
+                context: _args.value_of("k8s-context").map(|x| x.to_owned()),
+            }
         } else if let Some(url) = _args.value_of("k8s-url") {
             KubernetesConfig::Explicit {
                 url: url.try_into()?,
             }
         } else {
-            warn!("Neither --infer-k8s-config nor --k8s-url specified. Kubernetes discovery service disabled.");
+            warn!("Neither --k8s-from-kubeconfig nor --k8s-url specified. Kubernetes discovery service disabled.");
 
             return Ok(());
         };
-        kubernetes::register(
-            _service_manager,
-            config,
-            _args.value_of("k8s-namespace").map(|x| x.to_owned()),
-        )
-        .await?;
+        _service_manager
+            .register_service_discovery(
+                KubernetesServiceDiscovery::new(
+                    config,
+                    _args.value_of("k8s-namespace").map(|x| x.to_owned()),
+                )
+                .await?,
+            )
+            .await?;
     }
 
     Ok(())

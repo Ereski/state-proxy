@@ -145,10 +145,10 @@ async fn can_add_a_service() {
 }
 
 #[tokio::test]
-async fn can_add_then_remove_a_service() {
+async fn can_add_then_delete_a_service() {
     let manager = init(vec![
         DiscoveryEvent::add("0", true, 80, "http", ([10, 0, 0, 1], 80), "http"),
-        DiscoveryEvent::remove("0"),
+        DiscoveryEvent::delete("0"),
     ])
     .await;
 

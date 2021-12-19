@@ -49,5 +49,7 @@ tracing-subscriber = "0.3.3"
 tuple-transpose = { version = "0.1.0", default-features = false }
 
 [dev-dependencies]
+futures = { version = "0.3.19", default-features = false }
 pretty_assertions = "1.0.0"
-tokio = { version = "1.15.0", default-features = false, features = ["macros"] }
+serde_json = { version = "1.0.73", default-features = false }
+tokio = { version = "1.15.0", default-features = false, features = ["macros", "process", "time"] }
