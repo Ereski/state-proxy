@@ -1,6 +1,6 @@
 use super::{
-    DiscoveryEvent, DiscoveryService, DiscoveryServiceMetrics, Endpoint,
-    EndpointRef, Service, ServiceManager,
+    DiscoveryEvent, Endpoint, EndpointId, Service, ServiceDiscovery,
+    ServiceDiscoveryMetrics, ServiceManager,
 };
 use maplit::{hashmap, hashset};
 use pretty_assertions::assert_eq;
@@ -16,20 +16,20 @@ use tokio::{
 // How many iterations to run a spinlock for
 const SPINLOCK_TURNS: usize = 100;
 
-static TEST_DISCOVERY_SERVICE_NAME: &str = "test";
+static TEST_SERVICE_DISCOVERY_NAME: &str = "test";
 
-struct TestDiscoveryService {
+struct TestServiceDiscovery {
     events: Vec<DiscoveryEvent>,
-    metrics_recv: OneshotReceiver<Arc<DiscoveryServiceMetrics>>,
+    metrics_recv: OneshotReceiver<Arc<ServiceDiscoveryMetrics>>,
     status_send: OneshotSender<bool>,
 }
 
-impl TestDiscoveryService {
+impl TestServiceDiscovery {
     fn new(
         events: Vec<DiscoveryEvent>,
     ) -> (
         Self,
-        OneshotSender<Arc<DiscoveryServiceMetrics>>,
+        OneshotSender<Arc<ServiceDiscoveryMetrics>>,
         OneshotReceiver<bool>,
     ) {
         let (metrics_send, metrics_recv) = oneshot::channel();
@@ -47,9 +47,9 @@ impl TestDiscoveryService {
     }
 }
 
-impl DiscoveryService for TestDiscoveryService {
+impl ServiceDiscovery for TestServiceDiscovery {
     fn name(&self) -> Arc<String> {
-        Arc::new(TEST_DISCOVERY_SERVICE_NAME.to_owned())
+        Arc::new(TEST_SERVICE_DISCOVERY_NAME.to_owned())
     }
 
     fn run_with_sender(self, send: Sender<DiscoveryEvent>) {
@@ -83,20 +83,20 @@ impl DiscoveryService for TestDiscoveryService {
 }
 
 async fn init(events: Vec<DiscoveryEvent>) -> Arc<ServiceManager> {
-    let (discovery_service, metrics_send, status_recv) =
-        TestDiscoveryService::new(events);
+    let (service_discovery, metrics_send, status_recv) =
+        TestServiceDiscovery::new(events);
     let manager = ServiceManager::new();
     manager
-        .register_discovery_service(discovery_service)
+        .register_service_discovery(service_discovery)
         .await
         .unwrap();
     metrics_send
         .send(
             manager
-                .discovery_service_metrics
+                .service_discovery_metrics
                 .lock()
                 .await
-                .get(&TEST_DISCOVERY_SERVICE_NAME.to_owned())
+                .get(&TEST_SERVICE_DISCOVERY_NAME.to_owned())
                 .unwrap()
                 .clone(),
         )
@@ -108,124 +108,102 @@ async fn init(events: Vec<DiscoveryEvent>) -> Arc<ServiceManager> {
 }
 
 #[tokio::test]
-async fn can_register_a_discovery_service() {
+async fn can_register_a_service_discovery() {
     let manager = init(Vec::new()).await;
 
     assert_eq!(
-        *manager.registered_discovery_services.lock().await,
-        hashset! { Arc::new(TEST_DISCOVERY_SERVICE_NAME.to_owned()) }
+        *manager.registered_service_discovery_names.lock().await,
+        hashset! { Arc::new(TEST_SERVICE_DISCOVERY_NAME.to_owned()) }
     );
 }
 
 #[tokio::test]
 async fn can_add_a_service() {
-    let endpoint_ref = Arc::new(EndpointRef::new(
-        Arc::new(TEST_DISCOVERY_SERVICE_NAME.to_owned()),
-        "0",
-    ));
-    let service = Service::new(
-        "http",
-        80,
-        hashmap! {
-            endpoint_ref.clone() => Endpoint::new(true, "http", ([10, 0, 0, 1], 80)),
-        },
-    );
     let manager = init(vec![DiscoveryEvent::add(
-        endpoint_ref,
-        vec![service.clone()],
+        "0",
+        true,
+        80,
+        "http",
+        ([10, 0, 0, 1], 80),
+        "http",
     )])
     .await;
 
     assert_eq!(
-        *manager.services.lock().await,
+        *manager.port_service_map.lock().await,
         hashmap! {
-            80 => service,
+            80 => Service::new(
+                80,
+                "http",
+                hashmap! {
+                    EndpointId::new(Arc::new(TEST_SERVICE_DISCOVERY_NAME.to_owned()), "0") =>
+                        Endpoint::new(true, ([10, 0, 0, 1], 80), "http"),
+                },
+            ),
         }
     );
 }
 
 #[tokio::test]
 async fn can_add_then_remove_a_service() {
-    let endpoint_ref = Arc::new(EndpointRef::new(
-        Arc::new(TEST_DISCOVERY_SERVICE_NAME.to_owned()),
-        "0",
-    ));
-    let service = Service::new(
-        "http",
-        80,
-        hashmap! {
-            endpoint_ref.clone() => Endpoint::new(true, "http", ([10, 0, 0, 1], 80)),
-        },
-    );
     let manager = init(vec![
-        DiscoveryEvent::add(endpoint_ref.clone(), vec![service.clone()]),
-        DiscoveryEvent::remove(endpoint_ref),
+        DiscoveryEvent::add("0", true, 80, "http", ([10, 0, 0, 1], 80), "http"),
+        DiscoveryEvent::remove("0"),
     ])
     .await;
 
-    assert!(manager.services.lock().await.is_empty());
+    assert!(manager.port_service_map.lock().await.is_empty());
 }
 
 #[tokio::test]
 async fn can_add_then_suspend_a_service() {
-    let endpoint_ref = Arc::new(EndpointRef::new(
-        Arc::new(TEST_DISCOVERY_SERVICE_NAME.to_owned()),
-        "0",
-    ));
-    let mut service = Service::new(
-        "http",
-        80,
-        hashmap! {
-            endpoint_ref.clone() => Endpoint::new(true, "http", ([10, 0, 0, 1], 80)),
-        },
-    );
     let manager = init(vec![
-        DiscoveryEvent::add(endpoint_ref.clone(), vec![service.clone()]),
-        DiscoveryEvent::suspend(endpoint_ref.clone()),
+        DiscoveryEvent::add("0", true, 80, "http", ([10, 0, 0, 1], 80), "http"),
+        DiscoveryEvent::suspend("0"),
     ])
     .await;
 
-    service
-        .endpoints
-        .get_mut(&endpoint_ref)
-        .unwrap()
-        .is_available = false;
     assert_eq!(
-        *manager.services.lock().await,
+        *manager.port_service_map.lock().await,
         hashmap! {
-            80 => service,
+            80 => Service::new(
+                80,
+                "http",
+                hashmap! {
+                    EndpointId::new(Arc::new(TEST_SERVICE_DISCOVERY_NAME.to_owned()), "0") =>
+                        Endpoint::new(false, ([10, 0, 0, 1], 80), "http"),
+                },
+            ),
         }
     );
 }
 
 #[tokio::test]
 async fn can_add_then_resume_an_unavailable_service() {
-    let endpoint_ref = Arc::new(EndpointRef::new(
-        Arc::new(TEST_DISCOVERY_SERVICE_NAME.to_owned()),
-        "0",
-    ));
-    let mut service = Service::new(
-        "http",
-        80,
-        hashmap! {
-            endpoint_ref.clone() => Endpoint::new(false, "http", ([10, 0, 0, 1], 80)),
-        },
-    );
     let manager = init(vec![
-        DiscoveryEvent::add(endpoint_ref.clone(), vec![service.clone()]),
-        DiscoveryEvent::suspend(endpoint_ref.clone()),
+        DiscoveryEvent::add(
+            "0",
+            false,
+            80,
+            "http",
+            ([10, 0, 0, 1], 80),
+            "http",
+        ),
+        DiscoveryEvent::resume("0"),
     ])
     .await;
 
-    service
-        .endpoints
-        .get_mut(&endpoint_ref)
-        .unwrap()
-        .is_available = true;
     assert_eq!(
-        *manager.services.lock().await,
+        *manager.port_service_map.lock().await,
         hashmap! {
-            80 => service,
+            80 => Service::new(
+                80,
+                "http",
+                hashmap! {
+                    EndpointId::new(Arc::new(TEST_SERVICE_DISCOVERY_NAME.to_owned()), "0") =>
+                        Endpoint::new(true, ([10, 0, 0, 1], 80), "http"),
+                },
+            ),
         }
     );
 }

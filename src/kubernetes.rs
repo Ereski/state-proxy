@@ -1,5 +1,5 @@
 use crate::backend::{
-    DiscoveryEvent, DiscoveryService, Endpoint, EndpointRef, Service,
+    discovery::{DiscoveryEvent, ServiceDiscovery},
     ServiceManager,
 };
 use anyhow::{anyhow, Context, Result};
@@ -9,7 +9,6 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::{
     api::ListParams, runtime, runtime::watcher::Event, Api, Client, Config,
 };
-use maplit::hashmap;
 use std::{
     collections::{BTreeMap, HashSet},
     mem,
@@ -29,14 +28,14 @@ pub enum KubernetesConfig {
     Explicit { url: Uri },
 }
 
-struct KubernetesDiscoveryService {
+struct KubernetesServiceDiscovery {
     name: Arc<String>,
 
     config: KubernetesConfig,
     namespace: String,
 }
 
-impl KubernetesDiscoveryService {
+impl KubernetesServiceDiscovery {
     fn new(config: KubernetesConfig, namespace: Option<String>) -> Self {
         let namespace = namespace.unwrap_or_else(|| "default".to_owned());
         let name = match &config {
@@ -110,7 +109,7 @@ impl KubernetesDiscoveryService {
     }
 }
 
-impl DiscoveryService for KubernetesDiscoveryService {
+impl ServiceDiscovery for KubernetesServiceDiscovery {
     fn name(&self) -> Arc<String> {
         self.name.clone()
     }
@@ -152,10 +151,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
             Event::Deleted(pod) => {
                 if let Some(uid) = pod.metadata.uid {
                     self.known_pod_uids.remove(&uid);
-                    self.send(DiscoveryEvent::remove(Arc::new(
-                        EndpointRef::new(self.name.clone(), uid),
-                    )))
-                    .await?;
+                    self.send(DiscoveryEvent::remove(uid)).await?;
                 } else {
                     warn!(
                         "{}: Received a pod deletion event without the pod UID",
@@ -177,10 +173,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
                     mem::replace(&mut self.known_pod_uids, current_pod_uids);
                 for uid in old_pod_uids {
                     if !self.known_pod_uids.contains(&uid) {
-                        self.send(DiscoveryEvent::remove(Arc::new(
-                            EndpointRef::new(self.name.clone(), uid),
-                        )))
-                        .await?;
+                        self.send(DiscoveryEvent::remove(uid)).await?;
                     }
                 }
             }
@@ -208,59 +201,42 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
                         address, name, uid, self.name
                     )
                 })?;
-                let endpoint_ref =
-                    Arc::new(EndpointRef::new(self.name.clone(), uid));
 
                 match phase.as_ref() {
                     "Running" => {
                         if is_new {
-                            let services = self.services_from_annotations(
+                            self.discover_services(
                                 annotations,
-                                &endpoint_ref,
+                                uid,
                                 &name,
                                 address,
-                            )?;
-                            if services.is_empty() {
-                                warn!(
-                                    "{}: pod {} ({}) did not define any services",
-                                    self.name, name, endpoint_ref.uid
-                                );
-                            } else {
-                                self.send(DiscoveryEvent::add(
-                                    endpoint_ref,
-                                    services,
-                                ))
-                                .await?;
-                            }
+                            )
+                            .await?;
                         } else {
-                            self.send(DiscoveryEvent::resume(endpoint_ref))
-                                .await?;
+                            self.send(DiscoveryEvent::resume(uid)).await?;
                         }
                     }
                     "Succeeded" => {
-                        self.send(DiscoveryEvent::remove(endpoint_ref)).await?;
+                        self.send(DiscoveryEvent::remove(uid)).await?;
                     }
                     "Failed" => {
-                        self.send(DiscoveryEvent::suspend(endpoint_ref))
-                            .await?;
+                        self.send(DiscoveryEvent::suspend(uid)).await?;
                     }
                     "Unknown" => {
                         warn!(
                             "{}: pod {} ({}) is in an unknown state. Suspending pod until the situation resolves",
-                            self.name, name, endpoint_ref.uid
+                            self.name, name, uid
                         );
-                        self.send(DiscoveryEvent::suspend(endpoint_ref))
-                            .await?;
+                        self.send(DiscoveryEvent::suspend(uid)).await?;
                     }
                     // If the pod is only pending, we don't care
                     "Pending" => (),
                     unknown => {
                         warn!(
                             "{}: received an unknown pod status from Kubernetes for pod {} ({}): {}. Suspending pod until the situation resolves",
-                            self.name, name, endpoint_ref.uid, unknown
+                            self.name, name, uid, unknown
                         );
-                        self.send(DiscoveryEvent::suspend(endpoint_ref))
-                            .await?;
+                        self.send(DiscoveryEvent::suspend(uid)).await?;
                     }
                 }
             }
@@ -269,33 +245,25 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
         Ok(())
     }
 
-    async fn send(&self, event: DiscoveryEvent) -> Result<()> {
-        match self.send.send(event).await {
-            Ok(_) => Ok(()),
-            Err(_) => Err(anyhow!("channel closed")),
-        }
-    }
-
-    fn services_from_annotations(
+    async fn discover_services(
         &self,
         annotations: BTreeMap<String, String>,
-        endpoint_ref: &Arc<EndpointRef>,
+        uid: String,
         pod_name: &str,
         pod_address: IpAddr,
-    ) -> Result<Vec<Service>> {
-        let mut services = Vec::new();
+    ) -> Result<()> {
         if let Some(services_string) = annotations.get(SERVICES_ANNOTATION) {
             for service_string in services_string.split(',') {
-                services.push(self.parse_service_string(
+                self.send_service_from_string(
                     service_string,
-                    endpoint_ref,
+                    uid.clone(),
                     pod_name,
                     pod_address,
-                ).with_context(|| format!("while parsing service string '{}' for pod {} ({}) from Kubernetes cluster: {}", service_string, pod_name, endpoint_ref.uid, self.name))?);
+                ).await.with_context(|| format!("while handling service string '{}' for pod {} ({}) from Kubernetes cluster: {}", service_string, pod_name, uid, self.name))?;
             }
         }
 
-        Ok(services)
+        Ok(())
     }
 
     // The format is very simple:
@@ -304,17 +272,17 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
     //
     // `<external-*>` refers to what the proxy accepts from the outside world, and `<backend-*>`
     // refer to how the proxy communicates with the pod
-    fn parse_service_string(
+    async fn send_service_from_string(
         &self,
         service_string: &str,
-        endpoint_ref: &Arc<EndpointRef>,
+        uid: String,
         pod_name: &str,
         pod_address: IpAddr,
-    ) -> Result<Service> {
+    ) -> Result<()> {
         if service_string.split(':').count() > 4 {
             warn!(
                 "{}: service definition '{}' for pod {} ({}) has garbage at the end",
-                self.name, pod_name, endpoint_ref.uid, service_string
+                self.name, pod_name, uid, service_string
             );
         }
 
@@ -324,22 +292,31 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
 
         match parts {
             Some((
-                external_protocol,
                 external_port,
-                backend_protocol,
-                backend_port,
-            )) => Ok(Service::new(
                 external_protocol,
-                parse_port(external_port)?,
-                hashmap! {
-                    endpoint_ref.clone() => Endpoint::new(
-                        true,
-                        backend_protocol,
-                        (pod_address, parse_port(backend_port)?),
-                    ),
-                },
-            )),
+                backend_port,
+                backend_protocol,
+            )) => {
+                self.send(DiscoveryEvent::add(
+                    uid,
+                    true,
+                    parse_port(external_port)?,
+                    external_protocol,
+                    (pod_address, parse_port(backend_port)?),
+                    backend_protocol,
+                ))
+                .await?;
+
+                Ok(())
+            }
             _ => Err(anyhow!("invalid service string")),
+        }
+    }
+
+    async fn send(&self, event: DiscoveryEvent) -> Result<()> {
+        match self.send.send(event).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(anyhow!("channel closed")),
         }
     }
 }
@@ -350,7 +327,7 @@ pub async fn register(
     namespace: Option<String>,
 ) -> Result<()> {
     manager
-        .register_discovery_service(KubernetesDiscoveryService::new(
+        .register_service_discovery(KubernetesServiceDiscovery::new(
             config, namespace,
         ))
         .await

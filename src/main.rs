@@ -167,7 +167,7 @@ async fn register_kubernetes(
             return Ok(());
         };
         kubernetes::register(
-            &_service_manager,
+            _service_manager,
             config,
             _args.value_of("k8s-namespace").map(|x| x.to_owned()),
         )
