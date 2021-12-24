@@ -1,1 +1,1 @@
-pub async fn run(address: String) {}
+pub fn start(address: String) {}

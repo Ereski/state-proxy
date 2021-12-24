@@ -22,23 +22,21 @@ use tokio::sync::{
     Mutex,
 };
 
-struct HttpProtocol;
-
-impl Protocol for HttpProtocol {
-    fn name(&self) -> &str {
-        "http"
-    }
-}
-
-struct HttpClient {
+pub struct HttpClient {
     hyper_client: HyperClient,
 }
 
 impl HttpClient {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             hyper_client: Client::builder().build(HttpsConnector::new()),
         }
+    }
+}
+
+impl Default for HttpClient {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -59,67 +57,16 @@ impl ProtocolClient for HttpClient {
     }
 }
 
-struct HttpMessageChannel {
-    send: Sender<Message>,
-    // This needs to be in a `Mutex` because `Receiver::recv` takes a mut receiver, and the
-    // `DuplexChannel` trait defines an immutable receiver
-    recv: Mutex<Receiver<hyper::Result<Message>>>,
-}
-
-impl HttpMessageChannel {
-    fn new(hyper_client: HyperClient, addr: SocketAddr) -> Self {
-        let (request_send, mut request_recv) = mpsc::channel(1);
-        let (response_send, response_recv) = mpsc::channel(1);
-        tokio::spawn(async move {
-            while let Some(msg) = request_recv.recv().await {
-                // TODO: Lots unimplemented here
-                let response =
-                    hyper_client.request(unimplemented!()).await.map(|x| {
-                        let (header, body) = x.into_parts();
-                        unimplemented!()
-                    });
-                if response_send.send(response).await.is_err() {
-                    return;
-                }
-            }
-        });
-
-        HttpMessageChannel {
-            send: request_send,
-            recv: Mutex::new(response_recv),
-        }
-    }
-}
-
-#[async_trait]
-impl MessageChannel for HttpMessageChannel {
-    async fn send(&self, msg: Message) -> Result<()> {
-        match self.send.send(msg).await {
-            Ok(_) => Ok(()),
-            Err(_) => Err(HttpMessageChannelError::Closed.into()),
-        }
-    }
-
-    async fn recv(&self) -> Result<Message> {
-        match self.recv.lock().await.recv().await {
-            Some(res) => res.map_err(|err| err.into()),
-            None => Err(HttpMessageChannelError::Closed.into()),
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-enum HttpMessageChannelError {
-    #[error("hyper error: {0}")]
-    Hyper(#[from] hyper::Error),
-
-    #[error("HTTP channel closed")]
-    Closed,
-}
-
 type HyperClient = Client<HttpsConnector<HttpConnector>, Body>;
 
-struct HttpServer;
+#[derive(Default)]
+pub struct HttpServer;
+
+impl HttpServer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 impl ProtocolServer for HttpServer {
     fn protocol(&self) -> &dyn Protocol {
@@ -144,6 +91,10 @@ impl ProtocolServer for HttpServer {
         )));
     }
 
+    fn mute(&self, port: u16) {
+        unimplemented!()
+    }
+
     fn insert_state(&self, state: ServerConnectionState) -> Result<()> {
         unimplemented!()
     }
@@ -153,9 +104,68 @@ impl ProtocolServer for HttpServer {
     }
 }
 
-pub fn register(matchmaker: &mut Matchmaker) -> Result<()> {
-    matchmaker.register_client(HttpClient::new())?;
-    matchmaker.register_server(HttpServer)?;
+struct HttpMessageChannel {
+    sender: Sender<Message>,
+    // This needs to be in a `Mutex` because `Receiver::recv` takes a mut receiver, and the
+    // `DuplexChannel` trait defines an immutable receiver
+    receiver: Mutex<Receiver<hyper::Result<Message>>>,
+}
 
-    Ok(())
+impl HttpMessageChannel {
+    fn new(hyper_client: HyperClient, addr: SocketAddr) -> Self {
+        let (request_sender, mut request_receiver) = mpsc::channel(1);
+        let (response_sender, response_receiver) = mpsc::channel(1);
+        tokio::spawn(async move {
+            while let Some(msg) = request_receiver.recv().await {
+                // TODO: Lots unimplemented here
+                let response =
+                    hyper_client.request(unimplemented!()).await.map(|x| {
+                        let (header, body) = x.into_parts();
+                        unimplemented!()
+                    });
+                if response_sender.send(response).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        HttpMessageChannel {
+            sender: request_sender,
+            receiver: Mutex::new(response_receiver),
+        }
+    }
+}
+
+#[async_trait]
+impl MessageChannel for HttpMessageChannel {
+    async fn send(&self, msg: Message) -> Result<()> {
+        match self.sender.send(msg).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(HttpMessageChannelError::Closed.into()),
+        }
+    }
+
+    async fn recv(&self) -> Result<Message> {
+        match self.receiver.lock().await.recv().await {
+            Some(res) => res.map_err(|err| err.into()),
+            None => Err(HttpMessageChannelError::Closed.into()),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+enum HttpMessageChannelError {
+    #[error("hyper error: {0}")]
+    Hyper(#[from] hyper::Error),
+
+    #[error("HTTP channel closed")]
+    Closed,
+}
+
+struct HttpProtocol;
+
+impl Protocol for HttpProtocol {
+    fn name(&self) -> &str {
+        "http"
+    }
 }

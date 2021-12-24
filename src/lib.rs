@@ -12,3 +12,6 @@ pub mod kubernetes;
 pub mod ssh;
 #[cfg(feature = "protocol-websockets")]
 pub mod websockets;
+
+#[cfg(test)]
+pub mod test_utils;

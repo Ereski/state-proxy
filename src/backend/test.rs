@@ -1,13 +1,14 @@
 use super::{
-    DiscoveryEvent, Endpoint, EndpointId, Service, ServiceDiscovery,
+    DiscoveryEvent, Endpoint, EndpointId, PortEvent, Service, ServiceDiscovery,
     ServiceDiscoveryMetrics, ServiceManager,
 };
+use crate::test_utils::panic_on_timeout;
 use maplit::{hashmap, hashset};
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use tokio::{
     sync::{
-        mpsc::Sender,
+        mpsc::{self, Sender},
         oneshot::{self, Receiver as OneshotReceiver, Sender as OneshotSender},
     },
     task,
@@ -20,8 +21,8 @@ static TEST_SERVICE_DISCOVERY_NAME: &str = "test";
 
 struct TestServiceDiscovery {
     events: Vec<DiscoveryEvent>,
-    metrics_recv: OneshotReceiver<Arc<ServiceDiscoveryMetrics>>,
-    status_send: OneshotSender<bool>,
+    metrics_receiver: OneshotReceiver<Arc<ServiceDiscoveryMetrics>>,
+    status_sender: OneshotSender<bool>,
 }
 
 impl TestServiceDiscovery {
@@ -32,17 +33,17 @@ impl TestServiceDiscovery {
         OneshotSender<Arc<ServiceDiscoveryMetrics>>,
         OneshotReceiver<bool>,
     ) {
-        let (metrics_send, metrics_recv) = oneshot::channel();
-        let (status_send, status_recv) = oneshot::channel();
+        let (metrics_sender, metrics_receiver) = oneshot::channel();
+        let (status_sender, status_receiver) = oneshot::channel();
 
         (
             Self {
                 events,
-                metrics_recv,
-                status_send,
+                metrics_receiver,
+                status_sender,
             },
-            metrics_send,
-            status_recv,
+            metrics_sender,
+            status_receiver,
         )
     }
 }
@@ -52,12 +53,12 @@ impl ServiceDiscovery for TestServiceDiscovery {
         Arc::new(TEST_SERVICE_DISCOVERY_NAME.to_owned())
     }
 
-    fn run_with_sender(self, send: Sender<DiscoveryEvent>) {
+    fn run_with_sender(self, sender: Sender<DiscoveryEvent>) {
         tokio::spawn(async move {
             let n_events = u64::try_from(self.events.len()).unwrap();
             for event in self.events {
-                if let Err(_) = send.send(event).await {
-                    let _ = self.status_send.send(false);
+                if sender.send(event).await.is_err() {
+                    let _ = self.status_sender.send(false);
 
                     return;
                 }
@@ -65,10 +66,10 @@ impl ServiceDiscovery for TestServiceDiscovery {
 
             // Spinlock until the metrics show everything was processed
             let mut turns = SPINLOCK_TURNS;
-            let metrics = self.metrics_recv.await.ok().unwrap();
+            let metrics = self.metrics_receiver.await.ok().unwrap();
             while metrics.events_processed.get() != n_events {
                 if turns == 0 {
-                    let _ = self.status_send.send(false);
+                    let _ = self.status_sender.send(false);
 
                     return;
                 }
@@ -77,20 +78,33 @@ impl ServiceDiscovery for TestServiceDiscovery {
                 task::yield_now().await;
             }
 
-            let _ = self.status_send.send(true);
+            let _ = self.status_sender.send(true);
         });
     }
 }
 
-async fn init(events: Vec<DiscoveryEvent>) -> Arc<ServiceManager> {
-    let (service_discovery, metrics_send, status_recv) =
-        TestServiceDiscovery::new(events);
+async fn init<D>(
+    events: D,
+    port_event_sender: Option<Sender<PortEvent>>,
+) -> Arc<ServiceManager>
+where
+    D: IntoIterator<Item = DiscoveryEvent>,
+{
     let manager = ServiceManager::new();
+
+    if let Some(port_event_sender) = port_event_sender {
+        manager.send_ports_events_to(port_event_sender)
+    }
+
+    let (service_discovery, metrics_sender, status_receiver) =
+        TestServiceDiscovery::new(Vec::from_iter(events));
+
     manager
         .register_service_discovery(service_discovery)
         .await
         .unwrap();
-    metrics_send
+
+    metrics_sender
         .send(
             manager
                 .service_discovery_metrics
@@ -102,14 +116,14 @@ async fn init(events: Vec<DiscoveryEvent>) -> Arc<ServiceManager> {
         )
         .ok()
         .unwrap();
-    assert_eq!(status_recv.await, Ok(true));
+    assert_eq!(status_receiver.await, Ok(true));
 
     manager
 }
 
 #[tokio::test]
 async fn can_register_a_service_discovery() {
-    let manager = init(Vec::new()).await;
+    let manager = init(Vec::new(), None).await;
 
     assert_eq!(
         *manager.registered_service_discovery_names.lock().await,
@@ -119,14 +133,17 @@ async fn can_register_a_service_discovery() {
 
 #[tokio::test]
 async fn can_add_a_service() {
-    let manager = init(vec![DiscoveryEvent::add(
-        "0",
-        true,
-        80,
-        "http",
-        ([10, 0, 0, 1], 80),
-        "http",
-    )])
+    let manager = init(
+        [DiscoveryEvent::add(
+            "0",
+            true,
+            80,
+            "http",
+            ([10, 0, 0, 1], 80),
+            "http",
+        )],
+        None,
+    )
     .await;
 
     assert_eq!(
@@ -146,10 +163,20 @@ async fn can_add_a_service() {
 
 #[tokio::test]
 async fn can_add_then_delete_a_service() {
-    let manager = init(vec![
-        DiscoveryEvent::add("0", true, 80, "http", ([10, 0, 0, 1], 80), "http"),
-        DiscoveryEvent::delete("0"),
-    ])
+    let manager = init(
+        [
+            DiscoveryEvent::add(
+                "0",
+                true,
+                80,
+                "http",
+                ([10, 0, 0, 1], 80),
+                "http",
+            ),
+            DiscoveryEvent::delete("0"),
+        ],
+        None,
+    )
     .await;
 
     assert!(manager.port_service_map.lock().await.is_empty());
@@ -157,10 +184,20 @@ async fn can_add_then_delete_a_service() {
 
 #[tokio::test]
 async fn can_add_then_suspend_a_service() {
-    let manager = init(vec![
-        DiscoveryEvent::add("0", true, 80, "http", ([10, 0, 0, 1], 80), "http"),
-        DiscoveryEvent::suspend("0"),
-    ])
+    let manager = init(
+        [
+            DiscoveryEvent::add(
+                "0",
+                true,
+                80,
+                "http",
+                ([10, 0, 0, 1], 80),
+                "http",
+            ),
+            DiscoveryEvent::suspend("0"),
+        ],
+        None,
+    )
     .await;
 
     assert_eq!(
@@ -180,17 +217,20 @@ async fn can_add_then_suspend_a_service() {
 
 #[tokio::test]
 async fn can_add_then_resume_an_unavailable_service() {
-    let manager = init(vec![
-        DiscoveryEvent::add(
-            "0",
-            false,
-            80,
-            "http",
-            ([10, 0, 0, 1], 80),
-            "http",
-        ),
-        DiscoveryEvent::resume("0"),
-    ])
+    let manager = init(
+        [
+            DiscoveryEvent::add(
+                "0",
+                false,
+                80,
+                "http",
+                ([10, 0, 0, 1], 80),
+                "http",
+            ),
+            DiscoveryEvent::resume("0"),
+        ],
+        None,
+    )
     .await;
 
     assert_eq!(
@@ -205,5 +245,63 @@ async fn can_add_then_resume_an_unavailable_service() {
                 },
             ),
         }
+    );
+}
+
+#[tokio::test]
+async fn sends_open_and_close_port_events() {
+    let (event_sender, mut event_receiver) = mpsc::channel(1);
+    let _manager = init(
+        [
+            DiscoveryEvent::add(
+                "0",
+                false,
+                80,
+                "http",
+                ([10, 0, 0, 1], 80),
+                "http",
+            ),
+            DiscoveryEvent::delete("0"),
+        ],
+        Some(event_sender),
+    )
+    .await;
+
+    assert_eq!(
+        panic_on_timeout(event_receiver.recv()).await,
+        Some(PortEvent::Open {
+            port: 80,
+            protocol: "http".to_owned(),
+        })
+    );
+    assert_eq!(
+        panic_on_timeout(event_receiver.recv()).await,
+        Some(PortEvent::Close { port: 80 })
+    );
+}
+
+#[tokio::test]
+async fn sends_missed_open_events_on_registering_a_sender() {
+    let (event_sender, mut event_receiver) = mpsc::channel(1);
+    let manager = init(
+        [DiscoveryEvent::add(
+            "0",
+            false,
+            80,
+            "http",
+            ([10, 0, 0, 1], 80),
+            "http",
+        )],
+        None,
+    )
+    .await;
+    manager.send_ports_events_to(event_sender);
+
+    assert_eq!(
+        panic_on_timeout(event_receiver.recv()).await,
+        Some(PortEvent::Open {
+            port: 80,
+            protocol: "http".to_owned(),
+        })
     );
 }

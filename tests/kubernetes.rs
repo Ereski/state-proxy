@@ -1,4 +1,5 @@
-use futures::{join, select, FutureExt};
+use crate::test_utils::panic_on_timeout;
+use futures::join;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use state_proxy::{
@@ -8,10 +9,9 @@ use state_proxy::{
         API_VERSION_LABEL, SERVICES_ANNOTATION,
     },
 };
-use std::{future::Future, time::Duration};
-use tokio::{process::Command, sync::mpsc, time};
+use tokio::{process::Command, sync::mpsc};
 
-const FUTURE_TIMEOUT: Duration = Duration::from_secs(30);
+mod test_utils;
 
 static MINIKUBE_COMMAND: &str = "minikube";
 static MINIKUBE_PROFILE: &str = "state-proxy-kubernetes-test";
@@ -21,7 +21,7 @@ static MINIKUBE_PROFILE: &str = "state-proxy-kubernetes-test";
 // elsewhere concurrently
 #[tokio::test]
 #[ignore]
-async fn kubernetes() {
+async fn kubernetes_minikube() {
     let minikube_version = minikube(&["version", "--output=json"])
         .output()
         .await
@@ -59,7 +59,7 @@ async fn kubernetes() {
         panic!("Failed to set the minikube profile to {}", MINIKUBE_PROFILE);
     }
 
-    let (send, mut recv) = mpsc::channel(10);
+    let (sender, mut receiver) = mpsc::channel(10);
     KubernetesServiceDiscovery::new(
         KubernetesConfig::KubeConfig {
             context: Some(MINIKUBE_PROFILE.to_owned()),
@@ -68,7 +68,7 @@ async fn kubernetes() {
     )
     .await
     .unwrap()
-    .run_with_sender(send);
+    .run_with_sender(sender);
 
     // Add four pods:
     //
@@ -118,7 +118,7 @@ async fn kubernetes() {
         .as_str()
         .unwrap()
         .to_owned();
-    let event = panic_on_timeout(recv.recv()).await.unwrap();
+    let event = panic_on_timeout(receiver.recv()).await.unwrap();
     let backend_address = match &event {
         DiscoveryEvent::Add {
             backend_address, ..
@@ -137,7 +137,7 @@ async fn kubernetes() {
         )
     );
     assert_eq!(
-        panic_on_timeout(recv.recv()).await.unwrap(),
+        panic_on_timeout(receiver.recv()).await.unwrap(),
         DiscoveryEvent::resume(valid_pod_uid.clone())
     );
 
@@ -157,7 +157,7 @@ async fn kubernetes() {
         panic!("Failed to remove test pods");
     }
     assert_eq!(
-        panic_on_timeout(recv.recv()).await.unwrap(),
+        panic_on_timeout(receiver.recv()).await.unwrap(),
         DiscoveryEvent::delete(valid_pod_uid)
     );
 
@@ -182,15 +182,4 @@ fn kubectl(extra_args: &[&str]) -> Command {
     command.kill_on_drop(true).args(args);
 
     command
-}
-
-async fn panic_on_timeout<F, O>(future: F) -> O
-where
-    F: Future<Output = O>,
-{
-    select!(
-        res = future.fuse() => Some(res),
-        _ = time::sleep(FUTURE_TIMEOUT).fuse() => None
-    )
-    .expect("Future timed out")
 }

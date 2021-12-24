@@ -17,6 +17,9 @@ use tokio::{pin, sync::mpsc::Sender};
 use tracing::{error, info, warn};
 use tuple_transpose::TupleTranspose;
 
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
+
 pub static API_VERSION_LABEL: &str = "state-proxy.io/use";
 pub static API_VERSION: &str = "v0";
 pub static SERVICES_ANNOTATION: &str = "state-proxy.io/services";
@@ -70,7 +73,7 @@ impl KubernetesServiceDiscovery {
         })
     }
 
-    async fn run(self, send: Sender<DiscoveryEvent>) -> Result<()> {
+    async fn run(self, sender: Sender<DiscoveryEvent>) -> Result<()> {
         info!(
             "Connecting to the Kubernetes cluster at {}",
             self.config.cluster_url
@@ -96,7 +99,7 @@ impl KubernetesServiceDiscovery {
             },
         );
         pin!(pods);
-        let mut runtime = KubernetesDiscoveryRuntime::new(&self.name, send);
+        let mut runtime = KubernetesDiscoveryRuntime::new(&self.name, sender);
         while let Some(event) = pods.try_next().await.with_context(|| {
             format!(
                 "while watching pods for the Kubernetes cluster: {}",
@@ -118,9 +121,9 @@ impl ServiceDiscovery for KubernetesServiceDiscovery {
         self.name.clone()
     }
 
-    fn run_with_sender(self, send: Sender<DiscoveryEvent>) {
+    fn run_with_sender(self, sender: Sender<DiscoveryEvent>) {
         tokio::spawn(async move {
-            if let Err(err) = self.run(send).await {
+            if let Err(err) = self.run(sender).await {
                 error!("{:?}", err);
             }
         });
@@ -130,16 +133,16 @@ impl ServiceDiscovery for KubernetesServiceDiscovery {
 struct KubernetesDiscoveryRuntime<'a> {
     name: &'a Arc<String>,
 
-    send: Sender<DiscoveryEvent>,
+    sender: Sender<DiscoveryEvent>,
     known_pod_uids: HashSet<String>,
 }
 
 impl<'a> KubernetesDiscoveryRuntime<'a> {
-    fn new(name: &'a Arc<String>, send: Sender<DiscoveryEvent>) -> Self {
+    fn new(name: &'a Arc<String>, sender: Sender<DiscoveryEvent>) -> Self {
         Self {
             name,
 
-            send,
+            sender,
             known_pod_uids: HashSet::new(),
         }
     }
@@ -147,7 +150,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
     async fn handle_pod_event(&mut self, event: Event<Pod>) -> Result<()> {
         match event {
             Event::Applied(pod) => {
-                if let Some(uid) = &pod.metadata.uid {
+                if pod.metadata.uid.is_some() {
                     self.apply_pod(pod).await?;
                 }
             }
@@ -328,7 +331,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
     }
 
     async fn send(&self, event: DiscoveryEvent) -> Result<()> {
-        match self.send.send(event).await {
+        match self.sender.send(event).await {
             Ok(_) => Ok(()),
             Err(_) => Err(anyhow!("channel closed")),
         }

@@ -1,6 +1,6 @@
-use crate::{backend::ServiceManager, matchmaking::Matchmaker};
 use anyhow::{anyhow, Context, Result};
 use clap::{crate_authors, crate_description, App, Arg, ArgMatches};
+use state_proxy::{backend::ServiceManager, matchmaking::Matchmaker};
 use std::{
     ffi::{OsStr, OsString},
     process,
@@ -10,23 +10,12 @@ use tokio::runtime::{Builder, Runtime};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::fmt::time::Uptime;
 
-#[cfg(feature = "discovery-kubernetes")]
-use crate::kubernetes::{KubernetesConfig, KubernetesServiceDiscovery};
-
-mod backend;
-mod matchmaking;
-mod protocol;
-
 #[cfg(feature = "handover")]
-mod handover;
+use state_proxy::handover;
 #[cfg(feature = "protocol-http")]
-mod http;
+use state_proxy::http::{HttpClient, HttpServer};
 #[cfg(feature = "discovery-kubernetes")]
-mod kubernetes;
-#[cfg(feature = "protocol-ssh")]
-mod ssh;
-#[cfg(feature = "protocol-websockets")]
-mod websockets;
+use state_proxy::kubernetes::{KubernetesConfig, KubernetesServiceDiscovery};
 
 static PROGRAM_NAME: &str = "State Proxy";
 static PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -194,7 +183,8 @@ fn register_http(
     #[cfg(feature = "protocol-http")]
     {
         if _args.is_present("accept-http") {
-            http::register(_matchmaker)?;
+            _matchmaker.register_client(HttpClient::new())?;
+            _matchmaker.register_server(HttpServer)?;
         }
     }
 
@@ -207,9 +197,7 @@ fn register_ssh(
 ) -> Result<()> {
     #[cfg(feature = "protocol-ssh")]
     {
-        if _args.is_present("accept-ssh") {
-            ssh::register(_matchmaker)?;
-        }
+        if _args.is_present("accept-ssh") {}
     }
 
     Ok(())
@@ -221,9 +209,7 @@ fn register_websockets(
 ) -> Result<()> {
     #[cfg(feature = "protocol-websockets")]
     {
-        if _args.is_present("accept-websockets") {
-            websockets::register(_matchmaker)?;
-        }
+        if _args.is_present("accept-websockets") {}
     }
 
     Ok(())
@@ -233,7 +219,7 @@ fn init_handover(_args: &ArgMatches) {
     #[cfg(feature = "handover")]
     {
         if let Some(handover_socket) = _args.value_of("handover-socket") {
-            tokio::spawn(handover::run(handover_socket.to_owned()));
+            handover::start(handover_socket.to_owned());
         } else {
             warn!(
                 "--handover-socket not specified. This instance will not be able to send or receive state from other local instances",

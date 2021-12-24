@@ -9,12 +9,15 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{
-    mpsc::{self, Receiver},
-    Mutex,
+    mpsc::{self, Receiver, Sender},
+    Mutex, RwLock,
 };
 use tracing::{info, warn};
 
 pub mod discovery;
+
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
 
 #[cfg(test)]
 mod test;
@@ -23,10 +26,12 @@ mod test;
 // Events are pretty small so we can set this high to deal with spikes
 const DISCOVERY_EVENT_BUFFER_SIZE: usize = 1024;
 
-// Use locktree here to ensure deadlock-freedom
+// TODO: Use locktree here to ensure deadlock-freedom
 pub struct ServiceManager {
     registered_service_discovery_names: Mutex<HashSet<Arc<String>>>,
     port_service_map: Mutex<HashMap<u16, Service>>,
+
+    port_event_sender: RwLock<Option<Sender<PortEvent>>>,
 
     service_discovery_metrics:
         Mutex<HashMap<Arc<String>, Arc<ServiceDiscoveryMetrics>>>,
@@ -38,8 +43,32 @@ impl ServiceManager {
             registered_service_discovery_names: Mutex::new(HashSet::new()),
             port_service_map: Mutex::new(HashMap::new()),
 
+            port_event_sender: RwLock::new(None),
+
             service_discovery_metrics: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn send_ports_events_to(
+        self: &Arc<Self>,
+        port_event_sender: Sender<PortEvent>,
+    ) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let port_service_map = this.port_service_map.lock().await;
+            for service in port_service_map.values() {
+                let res = port_event_sender
+                    .send(PortEvent::Open {
+                        port: service.port,
+                        protocol: service.protocol.clone(),
+                    })
+                    .await;
+                if res.is_err() {
+                    return;
+                }
+            }
+            *this.port_event_sender.write().await = Some(port_event_sender);
+        });
     }
 
     pub async fn register_service_discovery<D>(
@@ -64,12 +93,12 @@ impl ServiceManager {
             let metrics = Arc::new(ServiceDiscoveryMetrics::new());
             service_discovery_metrics.insert(name.clone(), metrics.clone());
 
-            let (send, recv) = mpsc::channel(DISCOVERY_EVENT_BUFFER_SIZE);
-            service_discovery.run_with_sender(send);
+            let (sender, receiver) = mpsc::channel(DISCOVERY_EVENT_BUFFER_SIZE);
+            service_discovery.run_with_sender(sender);
             tokio::spawn(self.clone().listen_for_discovery_events(
                 name.clone(),
                 metrics,
-                recv,
+                receiver,
             ));
             registered_service_discovery_names.insert(name.clone());
 
@@ -83,9 +112,9 @@ impl ServiceManager {
         self: Arc<Self>,
         from: Arc<String>,
         metrics: Arc<ServiceDiscoveryMetrics>,
-        mut recv: Receiver<DiscoveryEvent>,
+        mut receiver: Receiver<DiscoveryEvent>,
     ) {
-        while let Some(event) = recv.recv().await {
+        while let Some(event) = receiver.recv().await {
             measure!(
                 &metrics.events_processed,
                 measure!(
@@ -127,11 +156,19 @@ impl ServiceManager {
                         );
                         port_service_map_entry.insert(Service::new(
                             external_port,
-                            external_protocol,
+                            external_protocol.clone(),
                             hashmap! {
                                 endpoint_id => endpoint,
                             },
                         ));
+                        Self::send_event(
+                            &*self.port_event_sender.read().await,
+                            PortEvent::Open {
+                                port: external_port,
+                                protocol: external_protocol,
+                            },
+                        )
+                        .await;
                     }
                     Entry::Occupied(mut port_service_map_entry) => {
                         match port_service_map_entry
@@ -179,8 +216,14 @@ impl ServiceManager {
                     }
                 }
 
+                let port_event_sender = self.port_event_sender.read().await;
                 for port in services_to_delete {
                     let old_service = port_service_map.remove(&port).unwrap();
+                    Self::send_event(
+                        &port_event_sender,
+                        PortEvent::Close { port },
+                    )
+                    .await;
                     info!(
                         "Stopped serving on port {} ({}): no endpoint",
                         port, old_service.protocol
@@ -248,6 +291,20 @@ impl ServiceManager {
             }
         }
     }
+
+    async fn send_event(sender: &Option<Sender<PortEvent>>, event: PortEvent) {
+        if let Some(sender) = sender {
+            if sender.send(event).await.is_err() {
+                panic!("TODO: can't send port event");
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PortEvent {
+    Open { port: u16, protocol: String },
+    Close { port: u16 },
 }
 
 #[derive(Debug, Default)]

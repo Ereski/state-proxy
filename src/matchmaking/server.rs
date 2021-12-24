@@ -16,7 +16,7 @@ pub trait ProtocolServer {
     fn protocol(&self) -> &dyn Protocol;
 
     /// Start listening on the given `bind_to` address. For every new connection, a request must
-    /// be sent into the `new_connection_send` which will be routed to a backend server. The
+    /// be sent into the `new_connection_sender` which will be routed to a backend server. The
     /// backend server will then decide how to reply to that connection request.
     ///
     /// The implementation should run the actual server through [`tokio::spawn`] or
@@ -24,8 +24,12 @@ pub trait ProtocolServer {
     fn listen(
         &self,
         bind_to: SocketAddr,
-        new_connection_send: Sender<NewConnectionRequest>,
+        new_connection_sender: Sender<NewConnectionRequest>,
     );
+
+    /// Stop listening on the given port and release all resources associated with it,
+    /// including open connections.
+    fn mute(&self, port: u16);
 
     /// Insert the given connection and its state into the server. If successful, the server
     /// should continue communicating through this socket stream as if it was created by it.
@@ -47,7 +51,7 @@ pub trait ProtocolServer {
 
 pub struct NewConnectionRequest {
     from: SocketAddr,
-    reply_send: OneshotSender<NewConnectionReply>,
+    reply_sender: OneshotSender<NewConnectionReply>,
 }
 
 pub struct NewConnectionReply {}

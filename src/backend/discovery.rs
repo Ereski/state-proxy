@@ -4,7 +4,7 @@ use tokio::sync::mpsc::Sender;
 pub trait ServiceDiscovery {
     fn name(&self) -> Arc<String>;
 
-    fn run_with_sender(self, send: Sender<DiscoveryEvent>);
+    fn run_with_sender(self, sender: Sender<DiscoveryEvent>);
 }
 
 #[derive(Debug, PartialEq, Eq)]
