@@ -18,17 +18,29 @@ use tracing::{error, info, warn};
 use tuple_transpose::TupleTranspose;
 
 #[cfg(feature = "benchmark")]
+#[doc(hidden)]
 pub mod benchmark;
 
-pub static API_VERSION_LABEL: &str = "state-proxy.io/use";
-pub static API_VERSION: &str = "v0";
+/// The label pods should use to declare their interest in being proxied, and the format version
+/// of their `state-proxy.io` annotations.
+pub static FORMAT_VERSION_LABEL: &str = "state-proxy.io/use";
+
+/// The current annotation format version.
+pub static FORMAT_VERSION: &str = "v0";
+
+/// The annotation used to define which services should be proxied for this pod.
 pub static SERVICES_ANNOTATION: &str = "state-proxy.io/services";
 
+/// Kubernetes configuration.
 pub enum KubernetesConfig {
+    /// Use kubeconfig with the given context, or `default`.
     KubeConfig { context: Option<String> },
+
+    /// Connect to a kubernetes cluster at the given URL.
     Explicit { url: Uri },
 }
 
+/// A [`ServiceDiscovery`] for Kubernetes.
 pub struct KubernetesServiceDiscovery {
     name: Arc<String>,
 
@@ -93,7 +105,7 @@ impl KubernetesServiceDiscovery {
                 // We are only interested in pods that have explicitly asked to be proxied with us
                 label_selector: Some(format!(
                     "{}={}",
-                    API_VERSION_LABEL, API_VERSION
+                    FORMAT_VERSION_LABEL, FORMAT_VERSION
                 )),
                 ..ListParams::default()
             },

@@ -6,14 +6,13 @@ use crate::{
     },
 };
 use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::Arc,
 };
-use tokio::{
-    io::AsyncRead,
-    sync::mpsc::{self, Sender},
+use tokio::sync::{
+    mpsc::{self, Sender},
+    RwLock,
 };
 use tracing::{info, warn};
 
@@ -30,28 +29,32 @@ const PORT_NOTIFICATION_BUFFER_SIZE: usize = 8;
 pub struct Matchmaker {
     service_manager: Arc<ServiceManager>,
 
-    protocol_clients: HashMap<String, Arc<dyn ProtocolClient + Send + Sync>>,
-    protocol_servers: HashMap<String, Arc<dyn ProtocolServer + Send + Sync>>,
-    open_ports: HashMap<u16, Arc<dyn ProtocolServer + Send + Sync>>,
+    protocol_clients:
+        RwLock<HashMap<String, Arc<dyn ProtocolClient + Send + Sync>>>,
+    protocol_servers:
+        RwLock<HashMap<String, Arc<dyn ProtocolServer + Send + Sync>>>,
+    open_ports: RwLock<HashMap<u16, Arc<dyn ProtocolServer + Send + Sync>>>,
 }
 
 impl Matchmaker {
-    pub fn new(service_manager: Arc<ServiceManager>) -> Self {
-        Self {
+    pub fn new(service_manager: Arc<ServiceManager>) -> Arc<Self> {
+        Arc::new(Self {
             service_manager,
 
-            protocol_clients: HashMap::new(),
-            protocol_servers: HashMap::new(),
-            open_ports: HashMap::new(),
-        }
+            protocol_clients: RwLock::new(HashMap::new()),
+            protocol_servers: RwLock::new(HashMap::new()),
+            open_ports: RwLock::new(HashMap::new()),
+        })
     }
 
-    pub fn register_client<C>(&mut self, client: C) -> Result<()>
+    pub async fn register_client<C>(&self, client: C) -> Result<()>
     where
         C: ProtocolClient + Send + Sync + 'static,
     {
         match self
             .protocol_clients
+            .write()
+            .await
             .entry(client.protocol().name().to_owned())
         {
             Entry::Vacant(entry) => {
@@ -67,12 +70,14 @@ impl Matchmaker {
         }
     }
 
-    pub fn register_server<S>(&mut self, server: S) -> Result<()>
+    pub async fn register_server<S>(&self, server: S) -> Result<()>
     where
         S: ProtocolServer + Send + Sync + 'static,
     {
         match self
             .protocol_servers
+            .write()
+            .await
             .entry(server.protocol().name().to_owned())
         {
             Entry::Vacant(entry) => {
@@ -88,13 +93,14 @@ impl Matchmaker {
         }
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(self: Arc<Self>) -> Result<()> {
         let (port_event_sender, mut port_event_receiver) =
             mpsc::channel(PORT_NOTIFICATION_BUFFER_SIZE);
-        self.service_manager.send_ports_events_to(port_event_sender);
+        self.service_manager.send_port_events_to(port_event_sender);
 
+        let this = Arc::new(self);
         while let Some(event) = port_event_receiver.recv().await {
-            self.handle_port_event(event)
+            this.handle_port_event(event)
                 .await
                 .context("while trying to process a port event")
                 .unwrap();
@@ -103,18 +109,21 @@ impl Matchmaker {
         panic!("service manager closed the channel")
     }
 
-    async fn handle_port_event(&mut self, event: PortEvent) -> Result<()> {
+    async fn handle_port_event(
+        self: &Arc<Self>,
+        event: PortEvent,
+    ) -> Result<()> {
         match event {
             PortEvent::Open { port, protocol } => {
                 if let Some(protocol_server) =
-                    self.protocol_servers.get(&protocol)
+                    self.protocol_servers.read().await.get(&protocol)
                 {
-                    assert!(self.open_ports.get(&port).is_none());
+                    assert!(self.open_ports.read().await.get(&port).is_none());
 
                     // TODO: get the bind ip from an argument
                     protocol_server.listen(
                         ([0, 0, 0, 0], port).into(),
-                        self.new_connection_sender(),
+                        self.clone().new_connection_sender(port),
                     );
 
                     info!(
@@ -126,7 +135,8 @@ impl Matchmaker {
                 }
             }
             PortEvent::Close { port } => {
-                let open_ports_entry = self.open_ports.entry(port);
+                let mut open_ports = self.open_ports.write().await;
+                let open_ports_entry = open_ports.entry(port);
                 if let Entry::Occupied(open_ports_entry) = open_ports_entry {
                     let (_, protocol_server) = open_ports_entry.remove_entry();
                     protocol_server.mute(port);
@@ -139,34 +149,38 @@ impl Matchmaker {
         Ok(())
     }
 
-    fn new_connection_sender(&self) -> Sender<NewConnectionRequest> {
+    fn new_connection_sender(
+        self: Arc<Self>,
+        port: u16,
+    ) -> Sender<NewConnectionRequest> {
         let (new_connection_sender, mut new_connection_receiver) =
             mpsc::channel(NEW_CONNECTION_BUFFER_SIZE);
         tokio::spawn(async move {
+            let mut i = 0_usize;
             while let Some(new_connection_request) =
                 new_connection_receiver.recv().await
             {
-                unimplemented!()
+                let this = self.clone();
+                i = i.overflowing_add(1).0;
+                tokio::spawn(async move {
+                    // TODO: error handling....
+                    let (address, protocol) = this
+                        .service_manager
+                        .get_endpoint_for(port, i)
+                        .await
+                        .unwrap();
+                    let message_channel = this
+                        .protocol_clients
+                        .read()
+                        .await
+                        .get(&protocol)
+                        .unwrap()
+                        .connect(address);
+                    unimplemented!()
+                });
             }
         });
 
         new_connection_sender
     }
-}
-
-/// Trait for channels that permit bidirectional, message-based communication.
-///
-/// Use [`macro@async_trait`] to implement this trait.
-#[async_trait]
-pub trait MessageChannel {
-    /// Try to send a message through the channel.
-    async fn send(&self, msg: Message) -> Result<()>;
-
-    /// Try to receive a message through the channel.
-    async fn recv(&self) -> Result<Message>;
-}
-
-pub struct Message {
-    data: Box<dyn AsyncRead + Send>,
-    // TODO: ancillary
 }

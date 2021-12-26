@@ -93,7 +93,7 @@ where
     let manager = ServiceManager::new();
 
     if let Some(port_event_sender) = port_event_sender {
-        manager.send_ports_events_to(port_event_sender)
+        manager.send_port_events_to(port_event_sender)
     }
 
     let (service_discovery, metrics_sender, status_receiver) =
@@ -147,7 +147,7 @@ async fn can_add_a_service() {
     .await;
 
     assert_eq!(
-        *manager.port_service_map.lock().await,
+        *manager.port_service_map.read().await,
         hashmap! {
             80 => Service::new(
                 80,
@@ -179,7 +179,7 @@ async fn can_add_then_delete_a_service() {
     )
     .await;
 
-    assert!(manager.port_service_map.lock().await.is_empty());
+    assert!(manager.port_service_map.read().await.is_empty());
 }
 
 #[tokio::test]
@@ -201,7 +201,7 @@ async fn can_add_then_suspend_a_service() {
     .await;
 
     assert_eq!(
-        *manager.port_service_map.lock().await,
+        *manager.port_service_map.read().await,
         hashmap! {
             80 => Service::new(
                 80,
@@ -234,7 +234,7 @@ async fn can_add_then_resume_an_unavailable_service() {
     .await;
 
     assert_eq!(
-        *manager.port_service_map.lock().await,
+        *manager.port_service_map.read().await,
         hashmap! {
             80 => Service::new(
                 80,
@@ -295,7 +295,7 @@ async fn sends_missed_open_events_on_registering_a_sender() {
         None,
     )
     .await;
-    manager.send_ports_events_to(event_sender);
+    manager.send_port_events_to(event_sender);
 
     assert_eq!(
         panic_on_timeout(event_receiver.recv()).await,

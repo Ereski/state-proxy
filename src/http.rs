@@ -1,26 +1,39 @@
 use crate::{
     matchmaking::{
         client::ProtocolClient,
-        server::{
-            NewConnectionReply, NewConnectionRequest, ProtocolServer,
-            ServerConnectionState, SocketStream,
-        },
-        Matchmaker, Message, MessageChannel,
+        server::{NewConnectionRequest, ProtocolServer, ServerConnectionState},
     },
-    protocol::Protocol,
+    protocol::{
+        AncillaryData, Message, MessageChannel, Protocol, SocketStream,
+    },
 };
 use anyhow::Result;
-use async_trait::async_trait;
 use hyper::{
     client::HttpConnector, service, Body, Client, Request, Response, Server,
 };
 use hyper_tls::HttpsConnector;
 use std::net::SocketAddr;
-use thiserror::Error;
-use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
-    Mutex,
-};
+use tokio::sync::mpsc::{Receiver, Sender};
+
+struct HttpProtocol;
+
+impl Protocol for HttpProtocol {
+    fn name(&self) -> &str {
+        "http"
+    }
+
+    fn translate_ancillary(
+        &self,
+        from_protocol: &str,
+        ancillary: Box<dyn AncillaryData>,
+    ) -> Result<Box<dyn AncillaryData>> {
+        unimplemented!()
+    }
+}
+
+struct HttpAncillaryData {}
+
+impl AncillaryData for HttpAncillaryData {}
 
 pub struct HttpClient {
     hyper_client: HyperClient,
@@ -40,20 +53,21 @@ impl Default for HttpClient {
     }
 }
 
-#[async_trait]
 impl ProtocolClient for HttpClient {
     fn protocol(&self) -> &dyn Protocol {
         &HttpProtocol
     }
 
-    async fn connect(
-        &self,
-        addr: SocketAddr,
-    ) -> Result<Box<dyn MessageChannel + Send>> {
-        Ok(Box::new(HttpMessageChannel::new(
-            self.hyper_client.clone(),
-            addr,
-        )))
+    fn connect(&self, addr: SocketAddr) -> Result<MessageChannel> {
+        let (message_channel, message_channel2) = MessageChannel::create();
+        let hyper_client = self.hyper_client.clone();
+        tokio::spawn(async move {
+            while let Some(message) = message_channel.recv().await {
+                unimplemented!()
+            }
+        });
+
+        Ok(message_channel2)
     }
 }
 
@@ -101,71 +115,5 @@ impl ProtocolServer for HttpServer {
 
     fn extract_states(self) -> Receiver<ServerConnectionState> {
         unimplemented!()
-    }
-}
-
-struct HttpMessageChannel {
-    sender: Sender<Message>,
-    // This needs to be in a `Mutex` because `Receiver::recv` takes a mut receiver, and the
-    // `DuplexChannel` trait defines an immutable receiver
-    receiver: Mutex<Receiver<hyper::Result<Message>>>,
-}
-
-impl HttpMessageChannel {
-    fn new(hyper_client: HyperClient, addr: SocketAddr) -> Self {
-        let (request_sender, mut request_receiver) = mpsc::channel(1);
-        let (response_sender, response_receiver) = mpsc::channel(1);
-        tokio::spawn(async move {
-            while let Some(msg) = request_receiver.recv().await {
-                // TODO: Lots unimplemented here
-                let response =
-                    hyper_client.request(unimplemented!()).await.map(|x| {
-                        let (header, body) = x.into_parts();
-                        unimplemented!()
-                    });
-                if response_sender.send(response).await.is_err() {
-                    return;
-                }
-            }
-        });
-
-        HttpMessageChannel {
-            sender: request_sender,
-            receiver: Mutex::new(response_receiver),
-        }
-    }
-}
-
-#[async_trait]
-impl MessageChannel for HttpMessageChannel {
-    async fn send(&self, msg: Message) -> Result<()> {
-        match self.sender.send(msg).await {
-            Ok(_) => Ok(()),
-            Err(_) => Err(HttpMessageChannelError::Closed.into()),
-        }
-    }
-
-    async fn recv(&self) -> Result<Message> {
-        match self.receiver.lock().await.recv().await {
-            Some(res) => res.map_err(|err| err.into()),
-            None => Err(HttpMessageChannelError::Closed.into()),
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-enum HttpMessageChannelError {
-    #[error("hyper error: {0}")]
-    Hyper(#[from] hyper::Error),
-
-    #[error("HTTP channel closed")]
-    Closed,
-}
-
-struct HttpProtocol;
-
-impl Protocol for HttpProtocol {
-    fn name(&self) -> &str {
-        "http"
     }
 }

@@ -118,10 +118,10 @@ fn run(args: ArgMatches) -> Result<()> {
             let service_manager = ServiceManager::new();
             register_kubernetes(&service_manager, &args).await?;
 
-            let mut matchmaker = Matchmaker::new(service_manager);
-            register_http(&mut matchmaker, &args)?;
-            register_ssh(&mut matchmaker, &args)?;
-            register_websockets(&mut matchmaker, &args)?;
+            let matchmaker = Matchmaker::new(service_manager);
+            register_http(&matchmaker, &args).await?;
+            register_ssh(&matchmaker, &args)?;
+            register_websockets(&matchmaker, &args)?;
             init_handover(&args);
 
             // No need to hold onto this anymore, so drop it to get a bit of memory back
@@ -176,25 +176,22 @@ async fn register_kubernetes(
     Ok(())
 }
 
-fn register_http(
-    _matchmaker: &mut Matchmaker,
-    _args: &ArgMatches,
+async fn register_http(
+    _matchmaker: &Matchmaker,
+    _args: &ArgMatches<'_>,
 ) -> Result<()> {
     #[cfg(feature = "protocol-http")]
     {
         if _args.is_present("accept-http") {
-            _matchmaker.register_client(HttpClient::new())?;
-            _matchmaker.register_server(HttpServer)?;
+            _matchmaker.register_client(HttpClient::new()).await?;
+            _matchmaker.register_server(HttpServer).await?;
         }
     }
 
     Ok(())
 }
 
-fn register_ssh(
-    _matchmaker: &mut Matchmaker,
-    _args: &ArgMatches,
-) -> Result<()> {
+fn register_ssh(_matchmaker: &Matchmaker, _args: &ArgMatches) -> Result<()> {
     #[cfg(feature = "protocol-ssh")]
     {
         if _args.is_present("accept-ssh") {}
@@ -204,7 +201,7 @@ fn register_ssh(
 }
 
 fn register_websockets(
-    _matchmaker: &mut Matchmaker,
+    _matchmaker: &Matchmaker,
     _args: &ArgMatches,
 ) -> Result<()> {
     #[cfg(feature = "protocol-websockets")]

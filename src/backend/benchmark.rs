@@ -12,7 +12,7 @@ impl BenchServiceManager {
         let service_manager2 = service_manager.clone();
         runtime.spawn(async move {
             let (sender, mut receiver) = mpsc::channel(1000000);
-            service_manager2.send_ports_events_to(sender);
+            service_manager2.send_port_events_to(sender);
             while receiver.recv().await.is_some() {}
         });
 

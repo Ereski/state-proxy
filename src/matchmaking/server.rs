@@ -1,13 +1,7 @@
-use crate::protocol::Protocol;
+use crate::protocol::{MessageChannel, Protocol, SocketStream};
 use anyhow::Result;
-use std::net::{SocketAddr, TcpStream, UdpSocket};
-use tokio::sync::{
-    mpsc::{Receiver, Sender},
-    oneshot::Sender as OneshotSender,
-};
-
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
+use std::net::SocketAddr;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 /// Trait for servers that can accept external connections and move those connections between
 /// different instances seamlessly.
@@ -51,10 +45,8 @@ pub trait ProtocolServer {
 
 pub struct NewConnectionRequest {
     from: SocketAddr,
-    reply_sender: OneshotSender<NewConnectionReply>,
+    channel: MessageChannel,
 }
-
-pub struct NewConnectionReply {}
 
 /// Frozen server state for a single connection.
 pub struct ServerConnectionState {
@@ -69,13 +61,4 @@ pub struct ServerConnectionState {
     /// possible to reduce the chance that an upgrade or downgrade will require a reconnection.
     /// Note that this does not apply to changes that impact security.
     internal: Vec<u8>,
-}
-
-#[non_exhaustive]
-pub enum SocketStream {
-    Tcp(TcpStream),
-    Udp(UdpSocket),
-
-    #[cfg(unix)]
-    Uds(UnixStream),
 }

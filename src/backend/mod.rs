@@ -1,3 +1,10 @@
+//! Management of proxied services. This module two main items:
+//!
+//! - The [`ServiceManager`] struct, which manages service discovery tasks and organizes and
+//!   collates information about services that have asked to be proxied by us.
+//! - The [`ServiceDiscovery`] trait, which are implemented by tasks that add, remove, and update
+//!   the list of services that have asked to be proxied by us.
+
 use crate::backend::discovery::{DiscoveryEvent, ServiceDiscovery};
 use anyhow::{anyhow, Result};
 use maplit::hashmap;
@@ -17,6 +24,7 @@ use tracing::{info, warn};
 pub mod discovery;
 
 #[cfg(feature = "benchmark")]
+#[doc(hidden)]
 pub mod benchmark;
 
 #[cfg(test)]
@@ -26,10 +34,17 @@ mod test;
 // Events are pretty small so we can set this high to deal with spikes
 const DISCOVERY_EVENT_BUFFER_SIZE: usize = 1024;
 
+/// Manages service discovery tasks and information about proxied services. [`ServiceDiscovery`]
+/// tasks are registered through the [`ServiceManager::register_service_discovery`] method.
+///
+/// [`ServiceManager::send_port_events_to`] registers a listener for [`PortEvent`]s as the
+/// ports and protocols the proxy exposes will depend on which are requested by proxied services.
+/// [`ServiceManager::get_endpoint_for`] will, in turn, select an available proxied endpoint that
+/// can process an external request.
 // TODO: Use locktree here to ensure deadlock-freedom
 pub struct ServiceManager {
     registered_service_discovery_names: Mutex<HashSet<Arc<String>>>,
-    port_service_map: Mutex<HashMap<u16, Service>>,
+    port_service_map: RwLock<HashMap<u16, Service>>,
 
     port_event_sender: RwLock<Option<Sender<PortEvent>>>,
 
@@ -38,10 +53,12 @@ pub struct ServiceManager {
 }
 
 impl ServiceManager {
+    /// Create an empty [`ServiceManager`]. This function returns an `Arc<ServiceManager>` as most
+    /// methods have that as receiver.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             registered_service_discovery_names: Mutex::new(HashSet::new()),
-            port_service_map: Mutex::new(HashMap::new()),
+            port_service_map: RwLock::new(HashMap::new()),
 
             port_event_sender: RwLock::new(None),
 
@@ -49,13 +66,17 @@ impl ServiceManager {
         })
     }
 
-    pub fn send_ports_events_to(
+    /// Set a channel to send [`PortEvent`]s to. When this method is called, all current open
+    /// ports events sent first.
+    // TODO: probably should make this async instead of spawning a task. Handle deadlocks in the
+    // caller
+    pub fn send_port_events_to(
         self: &Arc<Self>,
         port_event_sender: Sender<PortEvent>,
     ) {
         let this = self.clone();
         tokio::spawn(async move {
-            let port_service_map = this.port_service_map.lock().await;
+            let port_service_map = this.port_service_map.read().await;
             for service in port_service_map.values() {
                 let res = port_event_sender
                     .send(PortEvent::Open {
@@ -71,6 +92,44 @@ impl ServiceManager {
         });
     }
 
+    /// Select an endpoint that can serve a connection from the given external port. The selection
+    /// is semi-random and based on the `index` parameter.
+    ///
+    /// If there is an endpoint available, return its address and which protocol should be used to
+    /// communicate with it.
+    pub async fn get_endpoint_for(
+        &self,
+        port: u16,
+        mut index: usize,
+    ) -> Option<(SocketAddr, String)> {
+        let port_service_map = self.port_service_map.read().await;
+        if let Some(service) = port_service_map.get(&port) {
+            let n_endpoints = service.endpoints.len();
+            index %= n_endpoints;
+            for candidate in service.endpoints.values().skip(index) {
+                if candidate.is_available {
+                    return Some((
+                        candidate.address,
+                        candidate.protocol.clone(),
+                    ));
+                }
+            }
+            for candidate in
+                service.endpoints.values().take(n_endpoints - index)
+            {
+                if candidate.is_available {
+                    return Some((
+                        candidate.address,
+                        candidate.protocol.clone(),
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Register a [`ServiceDiscovery`] task.
     pub async fn register_service_discovery<D>(
         self: &Arc<Self>,
         service_discovery: D,
@@ -131,7 +190,7 @@ impl ServiceManager {
     }
 
     async fn process_event(&self, from: Arc<String>, event: DiscoveryEvent) {
-        let mut port_service_map = self.port_service_map.lock().await;
+        let mut port_service_map = self.port_service_map.write().await;
         match event {
             DiscoveryEvent::Add {
                 uid,
@@ -301,9 +360,13 @@ impl ServiceManager {
     }
 }
 
+/// A notification that the proxy listen on or close a specified port.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PortEvent {
+    /// Listen on the given port and with a server of the given protocol.
     Open { port: u16, protocol: String },
+
+    /// Close a port.
     Close { port: u16 },
 }
 
