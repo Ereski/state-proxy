@@ -2,6 +2,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use std::{
     net::{TcpStream, UdpSocket},
+    num::NonZeroU32,
     sync::Arc,
 };
 use tokio::sync::{
@@ -27,31 +28,41 @@ pub trait Protocol {
     /// multiple incompatible versions (e.g. SSH1 vs SSH2).
     fn name(&self) -> &str;
 
-    /// Translate ancillary data from another protocol.
-    fn translate_ancillary(
-        &self,
-        ancillary: Box<dyn AncillaryData>,
-    ) -> Result<Box<dyn AncillaryData>>;
+    /// Translate a message from another protocol.
+    fn translate(&self, message: Message) -> Result<Message>;
 
     /// Get the capabilities for this protocol.
     fn capabilities(&self) -> ProtocolCapabilities {
         ProtocolCapabilities::default()
     }
+
+    /// Craft a [`Message`] asking for a new multiplexed channel to be opened.
+    fn new_channel(&self) -> Message {
+        panic!("Protocol '{}' does not support multiplexing", self.name())
+    }
 }
 
 /// Protocol capabilities besides transmitting data.
-#[derive(Default)]
 pub struct ProtocolCapabilities {
-    multiplexing: bool,
+    /// The maximum number of multiplexed channels in a single connection for this protocol.
+    multiplexing: NonZeroU32,
+
+    /// Whether this protocol is capable of sending and receiving sockets.
     sockets: bool,
 }
 
-pub trait AncillaryData {
-    /// The protocol that defines this [`AncillaryData`].
-    fn protocol(&self) -> &dyn Protocol;
+impl Default for ProtocolCapabilities {
+    fn default() -> Self {
+        Self {
+            multiplexing: unsafe { NonZeroU32::new_unchecked(1) },
+            sockets: false,
+        }
+    }
+}
 
+pub trait AncillaryData {
     /// The ID of the channel if the protocol supports multiplexing.
-    fn channel_id(&self) -> Option<u64> {
+    fn channel_id(&self) -> Option<u32> {
         None
     }
 
@@ -67,31 +78,39 @@ pub trait AncillaryData {
     }
 }
 
-/// A channel that permit bidirectional, message-based communication.
+/// A channel that permits bidirectional, message-based communication.
 ///
 /// [`MessageChannel`]s can be freely cloned.
 #[derive(Clone)]
 pub struct MessageChannel {
+    protocol: Arc<dyn Protocol + Send + Sync>,
     sender: Sender<Message>,
     receiver: Arc<Mutex<Receiver<Message>>>,
 }
 
 impl MessageChannel {
     /// Create a connected [`MessageChannel`] pair.
-    pub fn create() -> (Self, Self) {
+    pub fn create(protocol: Arc<dyn Protocol + Send + Sync>) -> (Self, Self) {
         let (sender_a, receiver_a) = mpsc::channel(MESSAGE_CHANNEL_BUFFER_SIZE);
         let (sender_b, receiver_b) = mpsc::channel(MESSAGE_CHANNEL_BUFFER_SIZE);
 
         (
             Self {
+                protocol: protocol.clone(),
                 sender: sender_a,
                 receiver: Arc::new(Mutex::new(receiver_b)),
             },
             Self {
+                protocol,
                 sender: sender_b,
                 receiver: Arc::new(Mutex::new(receiver_a)),
             },
         )
+    }
+
+    /// Get the underlying protocol that this [`MessageChannel`] represents.
+    pub fn protocol(&self) -> &Arc<dyn Protocol + Send + Sync> {
+        &self.protocol
     }
 
     /// Try to send a message through the channel.

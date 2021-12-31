@@ -3,10 +3,10 @@ use futures::join;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use state_proxy::{
-    backend::discovery::{DiscoveryEvent, ServiceDiscovery},
+    backend::endpoint::{EndpointDiscovery, EndpointEvent},
     kubernetes::{
-        KubernetesConfig, KubernetesServiceDiscovery, API_VERSION,
-        API_VERSION_LABEL, SERVICES_ANNOTATION,
+        KubernetesConfig, KubernetesEndpointDiscovery, FORMAT_VERSION,
+        FORMAT_VERSION_LABEL, SERVICES_ANNOTATION,
     },
 };
 use tokio::{process::Command, sync::mpsc};
@@ -60,7 +60,7 @@ async fn kubernetes_minikube() {
     }
 
     let (sender, mut receiver) = mpsc::channel(10);
-    KubernetesServiceDiscovery::new(
+    KubernetesEndpointDiscovery::new(
         KubernetesConfig::KubeConfig {
             context: Some(MINIKUBE_PROFILE.to_owned()),
         },
@@ -85,21 +85,21 @@ async fn kubernetes_minikube() {
             "run",
             "1",
             "--image=alpine",
-            &format!("--labels={}=garbage", API_VERSION_LABEL)
+            &format!("--labels={}=garbage", FORMAT_VERSION_LABEL)
         ])
         .status(),
         kubectl(&[
             "run",
             "2",
             "--image=alpine",
-            &format!("--labels={}={}", API_VERSION_LABEL, API_VERSION)
+            &format!("--labels={}={}", FORMAT_VERSION_LABEL, FORMAT_VERSION)
         ])
         .status(),
         kubectl(&[
             "run",
             "3",
             "--image=alpine",
-            &format!("--labels={}={}", API_VERSION_LABEL, API_VERSION),
+            &format!("--labels={}={}", FORMAT_VERSION_LABEL, FORMAT_VERSION),
             &format!("--annotations={}=80:http:80:http", SERVICES_ANNOTATION),
             "--output=json"
         ])
@@ -120,14 +120,14 @@ async fn kubernetes_minikube() {
         .to_owned();
     let event = panic_on_timeout(receiver.recv()).await.unwrap();
     let backend_address = match &event {
-        DiscoveryEvent::Add {
+        EndpointEvent::Add {
             backend_address, ..
         } => backend_address.ip(),
         _ => panic!("Expected an `Add` event, received: {:#?}", event),
     };
     assert_eq!(
         event,
-        DiscoveryEvent::add(
+        EndpointEvent::add(
             &valid_pod_uid,
             false,
             80,
@@ -138,7 +138,7 @@ async fn kubernetes_minikube() {
     );
     assert_eq!(
         panic_on_timeout(receiver.recv()).await.unwrap(),
-        DiscoveryEvent::resume(valid_pod_uid.clone())
+        EndpointEvent::resume(valid_pod_uid.clone())
     );
 
     // Bring down the four pods created previously. Should only receive one delete event for the
@@ -158,7 +158,7 @@ async fn kubernetes_minikube() {
     }
     assert_eq!(
         panic_on_timeout(receiver.recv()).await.unwrap(),
-        DiscoveryEvent::delete(valid_pod_uid)
+        EndpointEvent::delete(valid_pod_uid)
     );
 
     let minikube_delete = minikube(&["delete"]).status().await.unwrap();

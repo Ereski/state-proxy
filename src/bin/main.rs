@@ -15,7 +15,7 @@ use state_proxy::handover;
 #[cfg(feature = "protocol-http")]
 use state_proxy::http::{HttpClient, HttpServer};
 #[cfg(feature = "discovery-kubernetes")]
-use state_proxy::kubernetes::{KubernetesConfig, KubernetesServiceDiscovery};
+use state_proxy::kubernetes::{KubernetesConfig, KubernetesEndpointDiscovery};
 
 static PROGRAM_NAME: &str = "State Proxy";
 static PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -163,8 +163,8 @@ async fn register_kubernetes(
             return Ok(());
         };
         _service_manager
-            .register_service_discovery(
-                KubernetesServiceDiscovery::new(
+            .register_endpoint_discovery(
+                KubernetesEndpointDiscovery::new(
                     config,
                     _args.value_of("k8s-namespace").map(|x| x.to_owned()),
                 )

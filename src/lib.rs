@@ -1,17 +1,17 @@
 //! A high performance, load balancing proxy. State Proxy can also store the application state for
-//! each connection so that proxied services can crash or restart without losing that state or the
+//! each connection so that proxied services can crash or restart without losing that state or
 //! external connections.
 //!
 //! Additional features include:
 //!
 //! - Support for multiple protocols, including HTTP(S) and SSH.
 //! - Protocol translation between external and internal connections. For example, external
-//!   clients connecting through HTTPS while the proxy communicates with backend services through
+//!   clients connecting through HTTPS while the proxy communicates with backend endpoints through
 //!   SSH.
-//! - Discovery of proxied services through Kubernetes.
+//! - Endpoint discovery through Kubernetes.
 //! - State handover between different proxy instances. With additional configuration, neither
 //!   state nor external connections are lost through upgrades or restarts of proxy instances.
-//!   This requires that both instances can communicate through Unix Domain Sockets.
+//!   This requires that both instances are able to communicate through Unix Domain Sockets.
 //!
 //! Planned features:
 //!

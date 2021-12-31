@@ -1,24 +1,26 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    fmt::{self, Display, Formatter},
+    net::SocketAddr,
+    sync::Arc,
+};
 use tokio::sync::mpsc::Sender;
 
-// TODO: actually this should be named `EndpointDiscovery`
-
-/// Trait for tasks that add, remove, and update the list of services that are asking to be
+/// Trait for tasks that add, remove, and update the list of endpoints that are asking to be
 /// proxied.
-pub trait ServiceDiscovery {
+pub trait EndpointDiscovery {
     /// Get name of this task. This name must be unique enough to avoid collisions with other
     /// tasks. It should also be descriptive enough to appear in error messages.
     fn name(&self) -> Arc<String>;
 
     /// Run the task. This method should spawn an asynchronous task with [`tokio::spawn`] or
-    /// [`tokio::task::spawn_blocking`], and [`DiscoveryEvent`]s should be sent through the given
+    /// [`tokio::task::spawn_blocking`], and [`EndpointEvent`]s should be sent through the given
     /// channel.
-    fn run_with_sender(self, sender: Sender<DiscoveryEvent>);
+    fn run_with_sender(self, sender: Sender<EndpointEvent>);
 }
 
 /// An event sent from a service discovery task.
 #[derive(Debug, PartialEq, Eq)]
-pub enum DiscoveryEvent {
+pub enum EndpointEvent {
     /// An endpoint has been added.
     Add {
         /// An unique ID representing this endpoint for the sending service discovery task. This
@@ -60,8 +62,8 @@ pub enum DiscoveryEvent {
     },
 }
 
-impl DiscoveryEvent {
-    /// Create a [`DiscoveryEvent::Add`] event.
+impl EndpointEvent {
+    /// Create a [`EndpointEvent::Add`] event.
     pub fn add<I, EP, BA, BP>(
         uid: I,
         is_available: bool,
@@ -86,7 +88,7 @@ impl DiscoveryEvent {
         }
     }
 
-    /// Create a [`DiscoveryEvent::Delete`] event.
+    /// Create a [`EndpointEvent::Delete`] event.
     pub fn delete<U>(uid: U) -> Self
     where
         U: Into<String>,
@@ -94,7 +96,7 @@ impl DiscoveryEvent {
         Self::Delete { uid: uid.into() }
     }
 
-    /// Create a [`DiscoveryEvent::Suspend`] event.
+    /// Create a [`EndpointEvent::Suspend`] event.
     pub fn suspend<U>(uid: U) -> Self
     where
         U: Into<String>,
@@ -102,11 +104,56 @@ impl DiscoveryEvent {
         Self::Suspend { uid: uid.into() }
     }
 
-    /// Create a [`DiscoveryEvent::Resume`] event.
+    /// Create a [`EndpointEvent::Resume`] event.
     pub fn resume<U>(uid: U) -> Self
     where
         U: Into<String>,
     {
         Self::Resume { uid: uid.into() }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct EndpointId {
+    pub(crate) endpoint_discovery_name: Arc<String>,
+    pub(crate) uid: String,
+}
+
+impl EndpointId {
+    pub(crate) fn new<I>(endpoint_discovery_name: Arc<String>, uid: I) -> Self
+    where
+        I: Into<String>,
+    {
+        Self {
+            endpoint_discovery_name,
+            uid: uid.into(),
+        }
+    }
+}
+
+impl Display for EndpointId {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "({}, {})", self.endpoint_discovery_name, self.uid)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Endpoint {
+    pub(crate) is_available: bool,
+    pub(crate) address: SocketAddr,
+    pub(crate) protocol: String,
+}
+
+impl Endpoint {
+    pub(crate) fn new<A, P>(is_available: bool, address: A, protocol: P) -> Self
+    where
+        A: Into<SocketAddr>,
+        P: Into<String>,
+    {
+        Self {
+            is_available,
+            address: address.into(),
+            protocol: protocol.into(),
+        }
     }
 }

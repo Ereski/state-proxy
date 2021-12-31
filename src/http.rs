@@ -12,8 +12,14 @@ use hyper::{
     client::HttpConnector, service, Body, Client, Request, Response, Server,
 };
 use hyper_tls::HttpsConnector;
-use std::net::SocketAddr;
+use lazy_static::lazy_static;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc::{Receiver, Sender};
+
+lazy_static! {
+    static ref HTTP_PROTOCOL: Arc<dyn Protocol + Send + Sync> =
+        Arc::new(HttpProtocol);
+}
 
 struct HttpProtocol;
 
@@ -22,11 +28,7 @@ impl Protocol for HttpProtocol {
         "http"
     }
 
-    fn translate_ancillary(
-        &self,
-        from_protocol: &str,
-        ancillary: Box<dyn AncillaryData>,
-    ) -> Result<Box<dyn AncillaryData>> {
+    fn translate(&self, message: Message) -> Result<Message> {
         unimplemented!()
     }
 }
@@ -54,12 +56,13 @@ impl Default for HttpClient {
 }
 
 impl ProtocolClient for HttpClient {
-    fn protocol(&self) -> &dyn Protocol {
-        &HttpProtocol
+    fn protocol(&self) -> &Arc<dyn Protocol + Send + Sync> {
+        &HTTP_PROTOCOL
     }
 
     fn connect(&self, addr: SocketAddr) -> Result<MessageChannel> {
-        let (message_channel, message_channel2) = MessageChannel::create();
+        let (message_channel, message_channel2) =
+            MessageChannel::create(HTTP_PROTOCOL.clone());
         let hyper_client = self.hyper_client.clone();
         tokio::spawn(async move {
             while let Some(message) = message_channel.recv().await {
@@ -83,8 +86,8 @@ impl HttpServer {
 }
 
 impl ProtocolServer for HttpServer {
-    fn protocol(&self) -> &dyn Protocol {
-        &HttpProtocol
+    fn protocol(&self) -> &Arc<dyn Protocol + Send + Sync> {
+        &HTTP_PROTOCOL
     }
 
     fn listen(

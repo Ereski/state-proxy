@@ -1,4 +1,4 @@
-use super::{discovery::DiscoveryEvent, PortEvent, ServiceManager};
+use super::{endpoint::EndpointEvent, PortEvent, ServiceManager};
 use std::sync::Arc;
 use tokio::{runtime::Runtime, sync::mpsc};
 
@@ -19,11 +19,7 @@ impl BenchServiceManager {
         BenchServiceManager { service_manager }
     }
 
-    pub async fn process_event(
-        &self,
-        from: Arc<String>,
-        event: DiscoveryEvent,
-    ) {
+    pub async fn process_event(&self, from: Arc<String>, event: EndpointEvent) {
         self.service_manager.process_event(from, event).await;
     }
 }

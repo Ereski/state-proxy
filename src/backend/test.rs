@@ -1,6 +1,6 @@
 use super::{
-    DiscoveryEvent, Endpoint, EndpointId, PortEvent, Service, ServiceDiscovery,
-    ServiceDiscoveryMetrics, ServiceManager,
+    Endpoint, EndpointDiscovery, EndpointDiscoveryMetrics, EndpointEvent,
+    EndpointId, PortEvent, Service, ServiceManager,
 };
 use crate::test_utils::panic_on_timeout;
 use maplit::{hashmap, hashset};
@@ -17,20 +17,20 @@ use tokio::{
 // How many iterations to run a spinlock for
 const SPINLOCK_TURNS: usize = 100;
 
-static TEST_SERVICE_DISCOVERY_NAME: &str = "test";
+static TEST_ENDPOINT_DISCOVERY_NAME: &str = "test";
 
-struct TestServiceDiscovery {
-    events: Vec<DiscoveryEvent>,
-    metrics_receiver: OneshotReceiver<Arc<ServiceDiscoveryMetrics>>,
+struct TestEndpointDiscovery {
+    events: Vec<EndpointEvent>,
+    metrics_receiver: OneshotReceiver<Arc<EndpointDiscoveryMetrics>>,
     status_sender: OneshotSender<bool>,
 }
 
-impl TestServiceDiscovery {
+impl TestEndpointDiscovery {
     fn new(
-        events: Vec<DiscoveryEvent>,
+        events: Vec<EndpointEvent>,
     ) -> (
         Self,
-        OneshotSender<Arc<ServiceDiscoveryMetrics>>,
+        OneshotSender<Arc<EndpointDiscoveryMetrics>>,
         OneshotReceiver<bool>,
     ) {
         let (metrics_sender, metrics_receiver) = oneshot::channel();
@@ -48,12 +48,12 @@ impl TestServiceDiscovery {
     }
 }
 
-impl ServiceDiscovery for TestServiceDiscovery {
+impl EndpointDiscovery for TestEndpointDiscovery {
     fn name(&self) -> Arc<String> {
-        Arc::new(TEST_SERVICE_DISCOVERY_NAME.to_owned())
+        Arc::new(TEST_ENDPOINT_DISCOVERY_NAME.to_owned())
     }
 
-    fn run_with_sender(self, sender: Sender<DiscoveryEvent>) {
+    fn run_with_sender(self, sender: Sender<EndpointEvent>) {
         tokio::spawn(async move {
             let n_events = u64::try_from(self.events.len()).unwrap();
             for event in self.events {
@@ -88,7 +88,7 @@ async fn init<D>(
     port_event_sender: Option<Sender<PortEvent>>,
 ) -> Arc<ServiceManager>
 where
-    D: IntoIterator<Item = DiscoveryEvent>,
+    D: IntoIterator<Item = EndpointEvent>,
 {
     let manager = ServiceManager::new();
 
@@ -96,21 +96,21 @@ where
         manager.send_port_events_to(port_event_sender)
     }
 
-    let (service_discovery, metrics_sender, status_receiver) =
-        TestServiceDiscovery::new(Vec::from_iter(events));
+    let (endpoint_discovery, metrics_sender, status_receiver) =
+        TestEndpointDiscovery::new(Vec::from_iter(events));
 
     manager
-        .register_service_discovery(service_discovery)
+        .register_endpoint_discovery(endpoint_discovery)
         .await
         .unwrap();
 
     metrics_sender
         .send(
             manager
-                .service_discovery_metrics
+                .endpoint_discovery_metrics
                 .lock()
                 .await
-                .get(&TEST_SERVICE_DISCOVERY_NAME.to_owned())
+                .get(&TEST_ENDPOINT_DISCOVERY_NAME.to_owned())
                 .unwrap()
                 .clone(),
         )
@@ -122,19 +122,19 @@ where
 }
 
 #[tokio::test]
-async fn can_register_a_service_discovery() {
+async fn can_register_a_endpoint_discovery() {
     let manager = init(Vec::new(), None).await;
 
     assert_eq!(
-        *manager.registered_service_discovery_names.lock().await,
-        hashset! { Arc::new(TEST_SERVICE_DISCOVERY_NAME.to_owned()) }
+        *manager.registered_endpoint_discovery_names.lock().await,
+        hashset! { Arc::new(TEST_ENDPOINT_DISCOVERY_NAME.to_owned()) }
     );
 }
 
 #[tokio::test]
 async fn can_add_a_service() {
     let manager = init(
-        [DiscoveryEvent::add(
+        [EndpointEvent::add(
             "0",
             true,
             80,
@@ -153,7 +153,7 @@ async fn can_add_a_service() {
                 80,
                 "http",
                 hashmap! {
-                    EndpointId::new(Arc::new(TEST_SERVICE_DISCOVERY_NAME.to_owned()), "0") =>
+                    EndpointId::new(Arc::new(TEST_ENDPOINT_DISCOVERY_NAME.to_owned()), "0") =>
                         Endpoint::new(true, ([10, 0, 0, 1], 80), "http"),
                 },
             ),
@@ -165,7 +165,7 @@ async fn can_add_a_service() {
 async fn can_add_then_delete_a_service() {
     let manager = init(
         [
-            DiscoveryEvent::add(
+            EndpointEvent::add(
                 "0",
                 true,
                 80,
@@ -173,7 +173,7 @@ async fn can_add_then_delete_a_service() {
                 ([10, 0, 0, 1], 80),
                 "http",
             ),
-            DiscoveryEvent::delete("0"),
+            EndpointEvent::delete("0"),
         ],
         None,
     )
@@ -186,7 +186,7 @@ async fn can_add_then_delete_a_service() {
 async fn can_add_then_suspend_a_service() {
     let manager = init(
         [
-            DiscoveryEvent::add(
+            EndpointEvent::add(
                 "0",
                 true,
                 80,
@@ -194,7 +194,7 @@ async fn can_add_then_suspend_a_service() {
                 ([10, 0, 0, 1], 80),
                 "http",
             ),
-            DiscoveryEvent::suspend("0"),
+            EndpointEvent::suspend("0"),
         ],
         None,
     )
@@ -207,7 +207,7 @@ async fn can_add_then_suspend_a_service() {
                 80,
                 "http",
                 hashmap! {
-                    EndpointId::new(Arc::new(TEST_SERVICE_DISCOVERY_NAME.to_owned()), "0") =>
+                    EndpointId::new(Arc::new(TEST_ENDPOINT_DISCOVERY_NAME.to_owned()), "0") =>
                         Endpoint::new(false, ([10, 0, 0, 1], 80), "http"),
                 },
             ),
@@ -219,7 +219,7 @@ async fn can_add_then_suspend_a_service() {
 async fn can_add_then_resume_an_unavailable_service() {
     let manager = init(
         [
-            DiscoveryEvent::add(
+            EndpointEvent::add(
                 "0",
                 false,
                 80,
@@ -227,7 +227,7 @@ async fn can_add_then_resume_an_unavailable_service() {
                 ([10, 0, 0, 1], 80),
                 "http",
             ),
-            DiscoveryEvent::resume("0"),
+            EndpointEvent::resume("0"),
         ],
         None,
     )
@@ -240,7 +240,7 @@ async fn can_add_then_resume_an_unavailable_service() {
                 80,
                 "http",
                 hashmap! {
-                    EndpointId::new(Arc::new(TEST_SERVICE_DISCOVERY_NAME.to_owned()), "0") =>
+                    EndpointId::new(Arc::new(TEST_ENDPOINT_DISCOVERY_NAME.to_owned()), "0") =>
                         Endpoint::new(true, ([10, 0, 0, 1], 80), "http"),
                 },
             ),
@@ -253,7 +253,7 @@ async fn sends_open_and_close_port_events() {
     let (event_sender, mut event_receiver) = mpsc::channel(1);
     let _manager = init(
         [
-            DiscoveryEvent::add(
+            EndpointEvent::add(
                 "0",
                 false,
                 80,
@@ -261,7 +261,7 @@ async fn sends_open_and_close_port_events() {
                 ([10, 0, 0, 1], 80),
                 "http",
             ),
-            DiscoveryEvent::delete("0"),
+            EndpointEvent::delete("0"),
         ],
         Some(event_sender),
     )
@@ -284,7 +284,7 @@ async fn sends_open_and_close_port_events() {
 async fn sends_missed_open_events_on_registering_a_sender() {
     let (event_sender, mut event_receiver) = mpsc::channel(1);
     let manager = init(
-        [DiscoveryEvent::add(
+        [EndpointEvent::add(
             "0",
             false,
             80,

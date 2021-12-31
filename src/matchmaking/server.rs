@@ -1,13 +1,13 @@
 use crate::protocol::{MessageChannel, Protocol, SocketStream};
 use anyhow::Result;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 /// Trait for servers that can accept external connections and move those connections between
 /// different instances seamlessly.
 pub trait ProtocolServer {
     /// Get the protocol this server can communicate in.
-    fn protocol(&self) -> &dyn Protocol;
+    fn protocol(&self) -> &Arc<dyn Protocol + Send + Sync>;
 
     /// Start listening on the given `bind_to` address. For every new connection, a request must
     /// be sent into the `new_connection_sender` which will be routed to a backend server. The

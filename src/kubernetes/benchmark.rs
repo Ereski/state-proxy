@@ -1,5 +1,5 @@
 use super::KubernetesDiscoveryRuntime;
-use crate::backend::discovery::DiscoveryEvent;
+use crate::backend::endpoint::EndpointEvent;
 use anyhow::Result;
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::watcher::Event;
@@ -14,7 +14,7 @@ impl<'a> BenchKubernetesDiscoveryRuntime<'a> {
     pub fn new(
         name: &'a Arc<String>,
         channel_capacity: usize,
-    ) -> (Self, Receiver<DiscoveryEvent>) {
+    ) -> (Self, Receiver<EndpointEvent>) {
         let (sender, receiver) = mpsc::channel(channel_capacity);
 
         (

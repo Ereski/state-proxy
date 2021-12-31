@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use state_proxy::backend::{
-    benchmark::BenchServiceManager, discovery::DiscoveryEvent,
+    benchmark::BenchServiceManager, endpoint::EndpointEvent,
 };
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -19,7 +19,7 @@ pub fn process_event(c: &mut Criterion) {
 
                 (
                     from.clone(),
-                    DiscoveryEvent::Add {
+                    EndpointEvent::Add {
                         uid: i.to_string(),
                         is_available: true,
                         external_port: 80,
@@ -40,7 +40,7 @@ pub fn process_event(c: &mut Criterion) {
             || {
                 i += 1;
 
-                (from.clone(), DiscoveryEvent::Suspend { uid: i.to_string() })
+                (from.clone(), EndpointEvent::Suspend { uid: i.to_string() })
             },
             |input| service_manager.process_event(input.0, input.1),
             BatchSize::SmallInput,
@@ -53,7 +53,7 @@ pub fn process_event(c: &mut Criterion) {
             || {
                 i += 1;
 
-                (from.clone(), DiscoveryEvent::Resume { uid: i.to_string() })
+                (from.clone(), EndpointEvent::Resume { uid: i.to_string() })
             },
             |input| service_manager.process_event(input.0, input.1),
             BatchSize::SmallInput,
@@ -66,7 +66,7 @@ pub fn process_event(c: &mut Criterion) {
             || {
                 i += 1;
 
-                (from.clone(), DiscoveryEvent::Delete { uid: i.to_string() })
+                (from.clone(), EndpointEvent::Delete { uid: i.to_string() })
             },
             |input| service_manager.process_event(input.0, input.1),
             BatchSize::SmallInput,

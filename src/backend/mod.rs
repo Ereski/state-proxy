@@ -1,19 +1,22 @@
-//! Management of proxied services. This module two main items:
+//! Management of proxied services.
 //!
-//! - The [`ServiceManager`] struct, which manages service discovery tasks and organizes and
-//!   collates information about services that have asked to be proxied by us.
-//! - The [`ServiceDiscovery`] trait, which are implemented by tasks that add, remove, and update
+//! This module two main items:
+//!
+//! - The [`ServiceManager`] struct, which manages service endpoint tasks and organizes and
+//!   collates that information into services that we should proxy.
+//! - The [`EndpointDiscovery`] trait, which are implemented by tasks that add, remove, and update
 //!   the list of services that have asked to be proxied by us.
 
-use crate::backend::discovery::{DiscoveryEvent, ServiceDiscovery};
+use crate::backend::endpoint::{
+    Endpoint, EndpointDiscovery, EndpointEvent, EndpointId,
+};
 use anyhow::{anyhow, Result};
 use maplit::hashmap;
 use metered::{measure, HitCount, Throughput};
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
-    fmt::{self, Display, Formatter},
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -21,7 +24,7 @@ use tokio::sync::{
 };
 use tracing::{info, warn};
 
-pub mod discovery;
+pub mod endpoint;
 
 #[cfg(feature = "benchmark")]
 #[doc(hidden)]
@@ -30,12 +33,12 @@ pub mod benchmark;
 #[cfg(test)]
 mod test;
 
-// How many `DiscoveryEvent`s can be buffered before a `ServiceDiscovery` will have to wait.
+// How many `EndpointEvent`s can be buffered before that `EndpointDiscovery` will have to wait.
 // Events are pretty small so we can set this high to deal with spikes
-const DISCOVERY_EVENT_BUFFER_SIZE: usize = 1024;
+const ENDPOINT_EVENT_BUFFER_SIZE: usize = 1024;
 
-/// Manages service discovery tasks and information about proxied services. [`ServiceDiscovery`]
-/// tasks are registered through the [`ServiceManager::register_service_discovery`] method.
+/// Manages service discovery tasks and information about proxied services. [`EndpointDiscovery`]
+/// tasks are registered through the [`ServiceManager::register_endpoint_discovery`] method.
 ///
 /// [`ServiceManager::send_port_events_to`] registers a listener for [`PortEvent`]s as the
 /// ports and protocols the proxy exposes will depend on which are requested by proxied services.
@@ -43,13 +46,13 @@ const DISCOVERY_EVENT_BUFFER_SIZE: usize = 1024;
 /// can process an external request.
 // TODO: Use locktree here to ensure deadlock-freedom
 pub struct ServiceManager {
-    registered_service_discovery_names: Mutex<HashSet<Arc<String>>>,
+    registered_endpoint_discovery_names: Mutex<HashSet<Arc<String>>>,
     port_service_map: RwLock<HashMap<u16, Service>>,
 
     port_event_sender: RwLock<Option<Sender<PortEvent>>>,
 
-    service_discovery_metrics:
-        Mutex<HashMap<Arc<String>, Arc<ServiceDiscoveryMetrics>>>,
+    endpoint_discovery_metrics:
+        Mutex<HashMap<Arc<String>, Arc<EndpointDiscoveryMetrics>>>,
 }
 
 impl ServiceManager {
@@ -57,12 +60,12 @@ impl ServiceManager {
     /// methods have that as receiver.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            registered_service_discovery_names: Mutex::new(HashSet::new()),
+            registered_endpoint_discovery_names: Mutex::new(HashSet::new()),
             port_service_map: RwLock::new(HashMap::new()),
 
             port_event_sender: RwLock::new(None),
 
-            service_discovery_metrics: Mutex::new(HashMap::new()),
+            endpoint_discovery_metrics: Mutex::new(HashMap::new()),
         })
     }
 
@@ -129,37 +132,38 @@ impl ServiceManager {
         None
     }
 
-    /// Register a [`ServiceDiscovery`] task.
-    pub async fn register_service_discovery<D>(
+    /// Register an [`EndpointDiscovery`] task.
+    pub async fn register_endpoint_discovery<D>(
         self: &Arc<Self>,
-        service_discovery: D,
+        endpoint_discovery: D,
     ) -> Result<()>
     where
-        D: ServiceDiscovery + Send + Sync + 'static,
+        D: EndpointDiscovery + Send + Sync + 'static,
     {
-        let name = service_discovery.name();
-        let mut registered_service_discovery_names =
-            self.registered_service_discovery_names.lock().await;
-        let mut service_discovery_metrics =
-            self.service_discovery_metrics.lock().await;
+        let name = endpoint_discovery.name();
+        let mut registered_endpoint_discovery_names =
+            self.registered_endpoint_discovery_names.lock().await;
+        let mut endpoint_discovery_metrics =
+            self.endpoint_discovery_metrics.lock().await;
 
-        if registered_service_discovery_names.contains(&name) {
+        if registered_endpoint_discovery_names.contains(&name) {
             Err(anyhow!(
                 "the discovery service {} is already registered",
                 name
             ))
         } else {
-            let metrics = Arc::new(ServiceDiscoveryMetrics::new());
-            service_discovery_metrics.insert(name.clone(), metrics.clone());
+            let metrics = Arc::new(EndpointDiscoveryMetrics::new());
+            endpoint_discovery_metrics.insert(name.clone(), metrics.clone());
 
-            let (sender, receiver) = mpsc::channel(DISCOVERY_EVENT_BUFFER_SIZE);
-            service_discovery.run_with_sender(sender);
-            tokio::spawn(self.clone().listen_for_discovery_events(
+            let (sender, receiver) = mpsc::channel(ENDPOINT_EVENT_BUFFER_SIZE);
+            endpoint_discovery.run_with_sender(sender);
+            tokio::spawn(Self::listen_for_discovery_events(
+                Arc::downgrade(self),
                 name.clone(),
                 metrics,
                 receiver,
             ));
-            registered_service_discovery_names.insert(name.clone());
+            registered_endpoint_discovery_names.insert(name.clone());
 
             info!("New discovery service registered: {}", name);
 
@@ -168,17 +172,22 @@ impl ServiceManager {
     }
 
     async fn listen_for_discovery_events(
-        self: Arc<Self>,
+        this: Weak<Self>,
         from: Arc<String>,
-        metrics: Arc<ServiceDiscoveryMetrics>,
-        mut receiver: Receiver<DiscoveryEvent>,
+        metrics: Arc<EndpointDiscoveryMetrics>,
+        mut receiver: Receiver<EndpointEvent>,
     ) {
         while let Some(event) = receiver.recv().await {
+            let this = if let Some(this) = this.upgrade() {
+                this
+            } else {
+                return;
+            };
             measure!(
                 &metrics.events_processed,
                 measure!(
                     &metrics.event_throughput,
-                    self.process_event(from.clone(), event).await
+                    this.process_event(from.clone(), event).await
                 )
             );
         }
@@ -189,10 +198,10 @@ impl ServiceManager {
         );
     }
 
-    async fn process_event(&self, from: Arc<String>, event: DiscoveryEvent) {
+    async fn process_event(&self, from: Arc<String>, event: EndpointEvent) {
         let mut port_service_map = self.port_service_map.write().await;
         match event {
-            DiscoveryEvent::Add {
+            EndpointEvent::Add {
                 uid,
                 is_available,
                 external_port,
@@ -210,7 +219,7 @@ impl ServiceManager {
                     Entry::Vacant(port_service_map_entry) => {
                         info!(
                             "New service requested on port {} ({}) from {}. Initially available endpoint: {:#?}",
-                            external_port, external_protocol, endpoint_id.service_discovery_name,
+                            external_port, external_protocol, endpoint_id.endpoint_discovery_name,
                             endpoint
                         );
                         port_service_map_entry.insert(Service::new(
@@ -238,7 +247,7 @@ impl ServiceManager {
                             Entry::Vacant(endpoint_entry) => {
                                 info!(
                                     "New endpoint '{}' added from '{}' for service on port {} ({}): {:#?}", endpoint_entry.key().uid,
-                                    endpoint_entry.key().service_discovery_name, external_port,
+                                    endpoint_entry.key().endpoint_discovery_name, external_port,
                                     external_protocol, endpoint
                                 );
                                 endpoint_entry.insert(endpoint);
@@ -247,7 +256,9 @@ impl ServiceManager {
                                 info!(
                                     "Endpoint '{}' from '{}' updated as: {:#?}",
                                     endpoint_entry.key().uid,
-                                    endpoint_entry.key().service_discovery_name,
+                                    endpoint_entry
+                                        .key()
+                                        .endpoint_discovery_name,
                                     endpoint
                                 );
                                 *endpoint_entry.get_mut() = endpoint;
@@ -256,7 +267,7 @@ impl ServiceManager {
                     }
                 }
             }
-            DiscoveryEvent::Delete { uid } => {
+            EndpointEvent::Delete { uid } => {
                 let endpoint_id = EndpointId::new(from, uid);
                 let mut found = false;
                 let mut services_to_delete = Vec::new();
@@ -265,7 +276,7 @@ impl ServiceManager {
                         found = true;
                         info!(
                             "Deleted endpoint '{}' ({}) for service on port {} ({})",
-                            endpoint_id.uid, endpoint_id.service_discovery_name, service.port,
+                            endpoint_id.uid, endpoint_id.endpoint_discovery_name, service.port,
                             service.protocol
                         );
                     }
@@ -291,12 +302,12 @@ impl ServiceManager {
 
                 if !found {
                     warn!(
-                        "Received a DiscoveryEvent::Delete from '{}' for an unknown endpoint: {}",
-                        endpoint_id.service_discovery_name, endpoint_id.uid
+                        "Received a EndpointEvent::Delete from '{}' for an unknown endpoint: {}",
+                        endpoint_id.endpoint_discovery_name, endpoint_id.uid
                     );
                 }
             }
-            DiscoveryEvent::Suspend { uid } => {
+            EndpointEvent::Suspend { uid } => {
                 let endpoint_id = EndpointId::new(from, uid);
                 let mut found = false;
                 for service in port_service_map.values_mut() {
@@ -308,7 +319,7 @@ impl ServiceManager {
                             endpoint.is_available = false;
                             info!(
                                 "Suspended endpoint '{}' ({}) for service on port {} ({})",
-                                endpoint_id.uid, endpoint_id.service_discovery_name, service.port,
+                                endpoint_id.uid, endpoint_id.endpoint_discovery_name, service.port,
                                 service.protocol
                             );
                         }
@@ -317,12 +328,12 @@ impl ServiceManager {
 
                 if !found {
                     warn!(
-                        "Received a DiscoveryEvent::Suspend from '{}' for an unknown endpoint: {}",
-                        endpoint_id.service_discovery_name, endpoint_id.uid
+                        "Received a EndpointEvent::Suspend from '{}' for an unknown endpoint: {}",
+                        endpoint_id.endpoint_discovery_name, endpoint_id.uid
                     );
                 }
             }
-            DiscoveryEvent::Resume { uid } => {
+            EndpointEvent::Resume { uid } => {
                 let endpoint_id = EndpointId::new(from, uid);
                 let mut found = false;
                 for service in port_service_map.values_mut() {
@@ -334,7 +345,7 @@ impl ServiceManager {
                             endpoint.is_available = true;
                             info!(
                                 "Resumed endpoint '{}' ({}) for service on port {} ({})",
-                                endpoint_id.uid, endpoint_id.service_discovery_name, service.port,
+                                endpoint_id.uid, endpoint_id.endpoint_discovery_name, service.port,
                                 service.protocol
                             );
                         }
@@ -343,8 +354,8 @@ impl ServiceManager {
 
                 if !found {
                     warn!(
-                        "Received a DiscoveryEvent::Resume from '{}' for an unknown endpoint: {}",
-                        endpoint_id.service_discovery_name, endpoint_id.uid
+                        "Received a EndpointEvent::Resume from '{}' for an unknown endpoint: {}",
+                        endpoint_id.endpoint_discovery_name, endpoint_id.uid
                     );
                 }
             }
@@ -371,12 +382,12 @@ pub enum PortEvent {
 }
 
 #[derive(Debug, Default)]
-struct ServiceDiscoveryMetrics {
+struct EndpointDiscoveryMetrics {
     event_throughput: Throughput,
     events_processed: HitCount,
 }
 
-impl ServiceDiscoveryMetrics {
+impl EndpointDiscoveryMetrics {
     fn new() -> Self {
         Self::default()
     }
@@ -402,51 +413,6 @@ impl Service {
             protocol: protocol.into(),
             endpoints,
             port,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct EndpointId {
-    service_discovery_name: Arc<String>,
-    uid: String,
-}
-
-impl EndpointId {
-    fn new<I>(service_discovery_name: Arc<String>, uid: I) -> Self
-    where
-        I: Into<String>,
-    {
-        Self {
-            service_discovery_name,
-            uid: uid.into(),
-        }
-    }
-}
-
-impl Display for EndpointId {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "({}, {})", self.service_discovery_name, self.uid)
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct Endpoint {
-    is_available: bool,
-    address: SocketAddr,
-    protocol: String,
-}
-
-impl Endpoint {
-    fn new<A, P>(is_available: bool, address: A, protocol: P) -> Self
-    where
-        A: Into<SocketAddr>,
-        P: Into<String>,
-    {
-        Self {
-            is_available,
-            address: address.into(),
-            protocol: protocol.into(),
         }
     }
 }

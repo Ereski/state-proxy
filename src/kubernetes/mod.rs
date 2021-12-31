@@ -1,4 +1,4 @@
-use crate::backend::discovery::{DiscoveryEvent, ServiceDiscovery};
+use crate::backend::endpoint::{EndpointDiscovery, EndpointEvent};
 use anyhow::{anyhow, Context, Result};
 use futures::TryStreamExt;
 use http::Uri;
@@ -40,15 +40,15 @@ pub enum KubernetesConfig {
     Explicit { url: Uri },
 }
 
-/// A [`ServiceDiscovery`] for Kubernetes.
-pub struct KubernetesServiceDiscovery {
+/// A [`EndpointDiscovery`] for Kubernetes.
+pub struct KubernetesEndpointDiscovery {
     name: Arc<String>,
 
     config: Config,
     namespace: String,
 }
 
-impl KubernetesServiceDiscovery {
+impl KubernetesEndpointDiscovery {
     pub async fn new(
         config: KubernetesConfig,
         namespace: Option<String>,
@@ -85,7 +85,7 @@ impl KubernetesServiceDiscovery {
         })
     }
 
-    async fn run(self, sender: Sender<DiscoveryEvent>) -> Result<()> {
+    async fn run(self, sender: Sender<EndpointEvent>) -> Result<()> {
         info!(
             "Connecting to the Kubernetes cluster at {}",
             self.config.cluster_url
@@ -128,12 +128,12 @@ impl KubernetesServiceDiscovery {
     }
 }
 
-impl ServiceDiscovery for KubernetesServiceDiscovery {
+impl EndpointDiscovery for KubernetesEndpointDiscovery {
     fn name(&self) -> Arc<String> {
         self.name.clone()
     }
 
-    fn run_with_sender(self, sender: Sender<DiscoveryEvent>) {
+    fn run_with_sender(self, sender: Sender<EndpointEvent>) {
         tokio::spawn(async move {
             if let Err(err) = self.run(sender).await {
                 error!("{:?}", err);
@@ -145,12 +145,12 @@ impl ServiceDiscovery for KubernetesServiceDiscovery {
 struct KubernetesDiscoveryRuntime<'a> {
     name: &'a Arc<String>,
 
-    sender: Sender<DiscoveryEvent>,
+    sender: Sender<EndpointEvent>,
     known_pod_uids: HashSet<String>,
 }
 
 impl<'a> KubernetesDiscoveryRuntime<'a> {
-    fn new(name: &'a Arc<String>, sender: Sender<DiscoveryEvent>) -> Self {
+    fn new(name: &'a Arc<String>, sender: Sender<EndpointEvent>) -> Self {
         Self {
             name,
 
@@ -169,7 +169,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
             Event::Deleted(pod) => {
                 if let Some(uid) = pod.metadata.uid {
                     self.known_pod_uids.remove(&uid);
-                    self.send(DiscoveryEvent::delete(uid)).await?;
+                    self.send(EndpointEvent::delete(uid)).await?;
                 } else {
                     warn!(
                         "{}: Received a pod deletion event without the pod UID",
@@ -190,7 +190,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
                     mem::replace(&mut self.known_pod_uids, current_pod_uids);
                 for uid in old_pod_uids {
                     if !self.known_pod_uids.contains(&uid) {
-                        self.send(DiscoveryEvent::delete(uid)).await?;
+                        self.send(EndpointEvent::delete(uid)).await?;
                     }
                 }
             }
@@ -231,21 +231,21 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
 
                 match phase.as_ref() {
                     "Running" => {
-                        self.send(DiscoveryEvent::resume(uid)).await?;
+                        self.send(EndpointEvent::resume(uid)).await?;
                     }
                     "Succeeded" => {
                         self.known_pod_uids.remove(&uid);
-                        self.send(DiscoveryEvent::delete(uid)).await?;
+                        self.send(EndpointEvent::delete(uid)).await?;
                     }
                     "Failed" => {
-                        self.send(DiscoveryEvent::suspend(uid)).await?;
+                        self.send(EndpointEvent::suspend(uid)).await?;
                     }
                     "Unknown" => {
                         warn!(
                             "{}: pod {} ({}) is in an unknown state. Suspending pod until the situation resolves",
                             self.name, name, uid
                         );
-                        self.send(DiscoveryEvent::suspend(uid)).await?;
+                        self.send(EndpointEvent::suspend(uid)).await?;
                     }
                     // If the pod is only pending, we don't care
                     "Pending" => (),
@@ -254,7 +254,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
                             "{}: received an unknown pod status from Kubernetes for pod {} ({}): {}. Suspending pod until the situation resolves",
                             self.name, name, uid, unknown
                         );
-                        self.send(DiscoveryEvent::suspend(uid)).await?;
+                        self.send(EndpointEvent::suspend(uid)).await?;
                     }
                 }
             }
@@ -326,7 +326,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
                 backend_port,
                 backend_protocol,
             )) => {
-                self.send(DiscoveryEvent::add(
+                self.send(EndpointEvent::add(
                     uid,
                     false,
                     parse_port(external_port)?,
@@ -342,7 +342,7 @@ impl<'a> KubernetesDiscoveryRuntime<'a> {
         }
     }
 
-    async fn send(&self, event: DiscoveryEvent) -> Result<()> {
+    async fn send(&self, event: EndpointEvent) -> Result<()> {
         match self.sender.send(event).await {
             Ok(_) => Ok(()),
             Err(_) => Err(anyhow!("channel closed")),
