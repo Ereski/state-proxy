@@ -22,7 +22,7 @@
 //!   proxy instances.
 
 pub mod backend;
-pub mod matchmaking;
+//pub mod matchmaking;
 pub mod protocol;
 
 #[cfg(feature = "handover")]

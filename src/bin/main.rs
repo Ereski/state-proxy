@@ -1,11 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{crate_authors, crate_description, App, Arg, ArgMatches};
-use state_proxy::{backend::ServiceManager, matchmaking::Matchmaker};
-use std::{
-    ffi::{OsStr, OsString},
-    process,
-    sync::Arc,
-};
+use state_proxy::{backend::ServiceManager, protocol::ProtocolRegistry};
+use std::{ffi::OsStr, process, sync::Arc};
 use tokio::runtime::{Builder, Runtime};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::fmt::time::Uptime;
@@ -13,7 +9,7 @@ use tracing_subscriber::fmt::time::Uptime;
 #[cfg(feature = "handover")]
 use state_proxy::handover;
 #[cfg(feature = "protocol-http")]
-use state_proxy::http::{HttpClient, HttpServer};
+use state_proxy::http::HTTP_PROTOCOL;
 #[cfg(feature = "discovery-kubernetes")]
 use state_proxy::kubernetes::{KubernetesConfig, KubernetesEndpointDiscovery};
 
@@ -29,13 +25,13 @@ fn main() {
     }
 }
 
-fn parse_command_line() -> ArgMatches<'static> {
+fn parse_command_line() -> ArgMatches {
     let app = App::new(PROGRAM_NAME)
         .author(crate_authors!(", "))
         .version(PROGRAM_VERSION)
         .about(crate_description!())
         .args(&[
-            Arg::with_name("worker-threads")
+            Arg::new("worker-threads")
                 .long("worker-threads")
                 .takes_value(true)
                 .value_name("COUNT")
@@ -44,22 +40,22 @@ fn parse_command_line() -> ArgMatches<'static> {
         ]);
     #[cfg(feature = "discovery-kubernetes")]
     let app = app.args(&[
-        Arg::with_name("k8s-namespace")
+        Arg::new("k8s-namespace")
             .long("k8s-namespace")
             .takes_value(true)
             .value_name("NAMESPACE")
             .help("List Kubernetes pods from the given namespace."),
-        Arg::with_name("k8s-url")
+        Arg::new("k8s-url")
             .long("k8s-url")
             .takes_value(true)
             .value_name("URL")
             .help("Connect to the Kubernetes cluster given by the URL."),
-        Arg::with_name("k8s-from-kubeconfig")
-            .short("k")
+        Arg::new("k8s-from-kubeconfig")
+            .short('k')
             .long("k8s-from-kubeconfig")
             .conflicts_with("k8s-url")
             .help("Connect to the Kubernetes cluster defined by a configuration file pointed by the `KUBECONFIG` environment variable, or `~/.kube/config` is `KUBECONFIG` is not set."),
-            Arg::with_name("k8s-context")
+            Arg::new("k8s-context")
                 .long("k8s-context")
                 .takes_value(true)
                 .value_name("CONTEXT")
@@ -67,19 +63,19 @@ fn parse_command_line() -> ArgMatches<'static> {
                 .help("Use the given context, When reading from a configuration file."),
     ]);
     #[cfg(feature = "protocol-http")]
-    let app = app.args(&[Arg::with_name("accept-http")
+    let app = app.args(&[Arg::new("accept-http")
         .long("accept-http")
         .help("Accept external HTTP connections.")]);
     #[cfg(feature = "protocol-ssh")]
-    let app = app.args(&[Arg::with_name("accept-ssh")
+    let app = app.args(&[Arg::new("accept-ssh")
         .long("accept-ssh")
         .help("Accept external SSH connections.")]);
     #[cfg(feature = "protocol-websockets")]
-    let app = app.args(&[Arg::with_name("accept-websockets")
+    let app = app.args(&[Arg::new("accept-websockets")
         .long("accept-websockets")
         .help("Accept external websockets connections.")]);
     #[cfg(feature = "handover")]
-    let app = app.args(&[Arg::with_name("handover-socket")
+    let app = app.args(&[Arg::new("handover-socket")
         .long("handover-socket")
         .takes_value(true)
         .value_name("ADDRESS")
@@ -88,14 +84,14 @@ fn parse_command_line() -> ArgMatches<'static> {
     app.get_matches()
 }
 
-fn arg_is_number(x: &OsStr) -> Result<(), OsString> {
+fn arg_is_number(x: &OsStr) -> Result<()> {
     if x.to_string_lossy()
         .find(|x: char| !x.is_digit(10))
         .is_none()
     {
         Ok(())
     } else {
-        Err(OsString::from("must be a number"))
+        Err(anyhow!("must be a number"))
     }
 }
 
@@ -115,13 +111,14 @@ fn run(args: ArgMatches) -> Result<()> {
             anyhow!("failed to initialize the asynchronous runtime")
         })?
         .block_on(async move {
+            let mut protocol_registry = ProtocolRegistry::new();
+            register_http(&mut protocol_registry, &args).await?;
+            register_ssh(&mut protocol_registry, &args)?;
+            register_websockets(&mut protocol_registry, &args)?;
+
             let service_manager = ServiceManager::new();
             register_kubernetes(&service_manager, &args).await?;
 
-            let matchmaker = Matchmaker::new(service_manager);
-            register_http(&matchmaker, &args).await?;
-            register_ssh(&matchmaker, &args)?;
-            register_websockets(&matchmaker, &args)?;
             init_handover(&args);
 
             // No need to hold onto this anymore, so drop it to get a bit of memory back
@@ -129,7 +126,7 @@ fn run(args: ArgMatches) -> Result<()> {
 
             info!("{} {} running", PROGRAM_NAME, PROGRAM_VERSION);
 
-            matchmaker.run().await
+            Ok(())
         })
 }
 
@@ -145,7 +142,7 @@ fn init_executor(args: &ArgMatches) -> Result<Runtime> {
 
 async fn register_kubernetes(
     _service_manager: &Arc<ServiceManager>,
-    _args: &ArgMatches<'_>,
+    _args: &ArgMatches,
 ) -> Result<()> {
     #[cfg(feature = "discovery-kubernetes")]
     {
@@ -177,21 +174,23 @@ async fn register_kubernetes(
 }
 
 async fn register_http(
-    _matchmaker: &Matchmaker,
-    _args: &ArgMatches<'_>,
+    _protocol_registry: &mut ProtocolRegistry,
+    _args: &ArgMatches,
 ) -> Result<()> {
     #[cfg(feature = "protocol-http")]
     {
         if _args.is_present("accept-http") {
-            _matchmaker.register_client(HttpClient::new()).await?;
-            _matchmaker.register_server(HttpServer).await?;
+            _protocol_registry.register(HTTP_PROTOCOL.clone())?;
         }
     }
 
     Ok(())
 }
 
-fn register_ssh(_matchmaker: &Matchmaker, _args: &ArgMatches) -> Result<()> {
+fn register_ssh(
+    _protocol_registry: &mut ProtocolRegistry,
+    _args: &ArgMatches,
+) -> Result<()> {
     #[cfg(feature = "protocol-ssh")]
     {
         if _args.is_present("accept-ssh") {}
@@ -201,7 +200,7 @@ fn register_ssh(_matchmaker: &Matchmaker, _args: &ArgMatches) -> Result<()> {
 }
 
 fn register_websockets(
-    _matchmaker: &Matchmaker,
+    _protocol_registry: &mut ProtocolRegistry,
     _args: &ArgMatches,
 ) -> Result<()> {
     #[cfg(feature = "protocol-websockets")]

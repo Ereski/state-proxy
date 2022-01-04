@@ -5,6 +5,10 @@ edition = "2021"
 authors = ["Carol Schulze <carol@ereski.org>"]
 description = "A load-balancing proxy that allows itself and backend services to be restarted without breaking external connections"
 
+[[bin]]
+name = "state-proxy"
+path = "src/bin/main.rs"
+
 [[bench]]
 name = "backend"
 harness = false
@@ -29,7 +33,8 @@ protocol-websockets = ["tokio-tungstenite"]
 protocol-ssh = ["thrussh"]
 
 # Enable the handover protocol allowing proxy instances to pass their state to
-# other local instances. Useful for gracefully upgrading proxy instances
+# other local instances. Useful for gracefully upgrading or restarting proxy
+# instances
 handover = ["tokio-seqpacket"]
 
 # Enable additional code for benchmarking through `cargo criterion`
@@ -38,8 +43,9 @@ benchmark = []
 [dependencies]
 anyhow = "1.0.52"
 async-trait = { version = "0.1.52", default-features = false }
-bytes = { version = "1.1.0", default-features = false, features = ["serde"] }
-clap = "2.34.0"
+bincode = { version = "1.3.3", optional = true, default-features = false }
+ciborium = { version = "0.2.0", optional = true, default-features = false }
+clap = { version = "3.0.1", features = ["cargo", "wrap_help"] }
 futures = { version = "0.3.19", default-features = false }
 http = { version = "0.2.6", default-features = false }
 hyper = { version = "0.14.16", optional = true, default-features = false, features = ["server", "http1", "http2"] }
@@ -49,10 +55,10 @@ kube = { version = "0.65.0", optional = true, default-features = false, features
 lazy_static = { version = "1.4.0", default-features = false }
 maplit = { version = "1.0.2", default-features = false }
 metered = { version = "0.8.0", default-features = false }
-serde = { version = "1.0.132", default-features = false, features = ["std", "rc"] }
-serde_derive = { version = "1.0.132", default-features = false }
-serde_json = { version = "1.0.73", default-features = false, features = ["std"] }
-strum = { version = "0.23.0", default-features = false }
+rmp-serde = { version = "0.15.5", optional = true, default-features = false }
+serde = { version = "1.0.133", default-features = false, features = ["std", "rc"] }
+serde_derive = { version = "1.0.133", default-features = false }
+serde_json = { version = "1.0.74", default-features = false, features = ["std"] }
 strum_macros = { version = "0.23.1", default-features = false }
 thiserror = { version = "1.0.30", default-features = false }
 thrussh = { version = "0.33.5", optional = true }
