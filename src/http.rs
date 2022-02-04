@@ -1,11 +1,6 @@
-use crate::protocol::{
-    Connection, Message, Protocol, ProtocolServer, SocketStream,
-};
-use anyhow::Result;
+use crate::protocol::{Connection, Message, Protocol, ProtocolServer};
 use async_trait::async_trait;
-use hyper::{
-    client::HttpConnector, service, Body, Client, Request, Response, Server,
-};
+use hyper::{client::HttpConnector, Body, Client};
 use hyper_tls::HttpsConnector;
 use lazy_static::lazy_static;
 use std::{net::SocketAddr, sync::Arc};
@@ -70,11 +65,11 @@ impl Connection for HttpClient {
         &self.protocol
     }
 
-    async fn receive(&mut self) -> anyhow::Result<Message> {
+    async fn send(&mut self, message: Message) -> anyhow::Result<()> {
         unimplemented!()
     }
 
-    async fn send(&mut self, message: Message) -> anyhow::Result<()> {
+    async fn receive(&mut self) -> anyhow::Result<Message> {
         unimplemented!()
     }
 }

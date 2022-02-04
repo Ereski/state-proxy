@@ -6,6 +6,7 @@ use std::{
     io::Cursor,
     net::{SocketAddr, TcpStream, UdpSocket},
     num::NonZeroU32,
+    pin::Pin,
     result,
     sync::Arc,
 };
@@ -68,7 +69,7 @@ pub trait Protocol: Send + Sync {
 
     async fn new_client(
         &self,
-        address: &str,
+        _address: &str,
     ) -> anyhow::Result<Box<dyn Connection>> {
         Err(anyhow!(
             "Protocol '{}' does not offer a client",
@@ -78,7 +79,7 @@ pub trait Protocol: Send + Sync {
 
     async fn assemble_client(
         &self,
-        state: ConnectionState,
+        _state: ConnectionState,
     ) -> anyhow::Result<Box<dyn Connection>> {
         Err(anyhow!(
             "Protocol '{}' cannot assemble clients",
@@ -88,7 +89,7 @@ pub trait Protocol: Send + Sync {
 
     async fn new_server(
         &self,
-        address: SocketAddr,
+        _address: SocketAddr,
     ) -> anyhow::Result<Box<dyn ProtocolServer>> {
         Err(anyhow!(
             "Protocol '{}' does not offer a server",
@@ -103,7 +104,7 @@ pub trait ProtocolServer: Send {
 
     async fn assemble_connection(
         &mut self,
-        state: ConnectionState,
+        _state: ConnectionState,
     ) -> anyhow::Result<()> {
         Err(anyhow!("This server does not support connection assembly"))
     }
@@ -113,9 +114,9 @@ pub trait ProtocolServer: Send {
 pub trait Connection: Send {
     fn protocol(&self) -> &Arc<dyn Protocol>;
 
-    async fn receive(&mut self) -> anyhow::Result<Message>;
-
     async fn send(&mut self, message: Message) -> anyhow::Result<()>;
+
+    async fn receive(&mut self) -> anyhow::Result<Message>;
 
     async fn new_channel(&mut self) -> anyhow::Result<u32> {
         Err(anyhow!("This connection does not support multiplexing"))
@@ -149,8 +150,9 @@ pub struct ProtocolCapabilities {
     /// Whether this protocol's implementation supports connection disassembly and reassembly.
     pub disasm: bool,
 
-    /// Whether this protocol has meaningful message boundaries. If false, this protocol should
-    /// never return or accept more than one [`Message`] per direction per connection.
+    /// Whether this protocol has meaningful message boundaries. If false, sequential messages in
+    /// the same multiple channel must be interpreted as forming a single, contiguous stream of
+    /// data.
     pub message_boundaries: bool,
 
     /// The maximum number of multiplexed channels in a single connection for this protocol.
@@ -176,7 +178,7 @@ impl Default for ProtocolCapabilities {
 #[derive(Default)]
 pub struct Message {
     /// Raw data, if any.
-    pub data: Option<Box<dyn AsyncRead + Send>>,
+    pub data: Option<Pin<Box<dyn AsyncRead + Send>>>,
 
     /// Length of of the [`Message::data`] field if available.
     pub size: Option<u64>,
@@ -197,7 +199,7 @@ impl Message {
         D: AsyncRead + Send + 'static,
     {
         Self {
-            data: Some(Box::new(data)),
+            data: Some(Box::pin(data)),
             ..Self::default()
         }
     }
@@ -206,7 +208,11 @@ impl Message {
     where
         B: AsRef<[u8]> + Unpin + Send + 'static,
     {
-        Self::with_data(Cursor::new(buffer))
+        let buffer_len = buffer.as_ref().len();
+        let mut message = Self::with_data(Cursor::new(buffer));
+        message.size = Some(u64::try_from(buffer_len).unwrap());
+
+        message
     }
 }
 

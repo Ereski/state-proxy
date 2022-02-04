@@ -1,4 +1,4 @@
-use super::{endpoint::EndpointEvent, PortEvent, ServiceManager};
+use super::{endpoint::EndpointEvent, ServiceManager};
 use std::sync::Arc;
 use tokio::{runtime::Runtime, sync::mpsc};
 

@@ -4,7 +4,7 @@ use anyhow::Result;
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::watcher::Event;
 use std::sync::Arc;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver};
 
 pub struct BenchKubernetesDiscoveryRuntime<'a> {
     kubernetes_runtime: KubernetesDiscoveryRuntime<'a>,
